@@ -1,4 +1,0 @@
-click==7.1.2
-requests==2.25.0
-PyJWT==2.3.0
-cryptography==3.4.7

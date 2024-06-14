@@ -1,59 +1,90 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 name: Deployment status
-description: Creates and manages GitHub deployments and releases on target repositories
+description: Sets the deployment status for a deployment on a different repository
 
 inputs:
-  command:
-    description: Command to run. Supported values delete-deployment, delete-release, get-all-deployments, get-all-releases, update-deployment, update-release
-    required: false
-    type: string
-    default: update-deployment
   github_org:
     description: GitHub organization hosting the target repository
-    required: false
     type: string
-    default: mozilla
+    required: true
   repository:
     description: GitHub repository to target
     type: string
     required: true
-  environment_url:
-    description: Environment URL to set in deployment
+  deployment_id:
+    description: The id of the dpeloyment we want to set the status for
     type: string
-    required: false 
-    default: ""
-  state:
-    description: State of deployment. Supported values in_progress, success, failed
-    type: choice
-    default: in_progress
+    required: false
+  sha:
+    description: Deployed git sha
+    type: string
+    required: false
+  ref:
+    description: Deployed git ref
+    type: string
+    required: false
   environment:
     description: Target deployment environment
     type: string
-    default: staging
-  ref: 
-    description: Deployed git ref
-    type: string
+    required: false
+  state:
+    description: State of deployment. Supported values in_progress, success, failure
+    type: choice
     required: true
+  environment_url:
+    description: Environment URL to set in deployment
+    type: string
+    required: false
+  app_id:
+    description: The id of the GitHub app to set the deployment status
+    type: string
+    required: false
+  private_key:
+    description: The private key of the deployment status app
+    type: string
+    required: false
 
 runs:
-  using: docker
-  image: Dockerfile
-  args:
-    - -r
-    - ${{ inputs.repository }}
-    - -o
-    - ${{ inputs.github_org }}
-    - ${{ inputs.command }}
-    - --tag
-    - ${{ inputs.ref }}
-    - --environment
-    - ${{ inputs.environment }}
-    - --state
-    -  ${{ inputs.state }}
-    - --environment_url
-    - ${{ inputs.environment_url }}
+  using: "composite"
+  steps:
+    - uses: actions/create-github-app-token@v1
+      id: app-token
+      with:
+        app-id: "${{ inputs.app_id || env.APPLICATION_ID }}"
+        private-key: "${{ inputs.private_key || env.PRIVATE_KEY }}"
+        owner: "${{ inputs.github_org }}"
+        repositories: "${{ inputs.repository }}"
+    - name: Set deployment status
+      uses: actions/github-script@v7
+      with:
+        github-token: "${{ steps.app-token.outputs.token }}"
+        script: |
+          const inputs = ${{ toJSON(inputs) }};
+          let deployment_id = inputs.deployment_id;
 
+          if (!deployment_id) {
+            deployment_data = {
+              owner: inputs.github_org,
+              repo: inputs.repository,
+              sha: inputs.sha,
+              ref: inputs.ref,
+              environment: inputs.environment,
+            }
+            const deployments = (await github.rest.repos.listDeployments(deployment_data)).data;
+            if (deployments.length) {
+              deployment_id = deployments[0].id;
+            } else {
+              deployment_data.auto_merge = false;
+              deployment_data.required_contexts = [];
+              const deployment = (await github.rest.repos.createDeployment(deployment_data)).data;
+              deployment_id = deployment.id;
+            }
+          }
 
+          github.rest.repos.createDeploymentStatus({
+            owner: inputs.github_org,
+            repo: inputs.repository,
+            deployment_id,
+            state: inputs.state,
+            log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            environment_url: inputs.environment_url,
+          })
