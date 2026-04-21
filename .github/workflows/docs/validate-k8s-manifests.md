@@ -26,7 +26,7 @@ on:
 
 jobs:
   validate:
-    uses: mozilla-it/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
 ```
 
 ### Strict validation
@@ -41,7 +41,7 @@ on:
 
 jobs:
   validate:
-    uses: mozilla-it/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
     with:
       strict: true
 ```
@@ -58,11 +58,11 @@ on:
 
 jobs:
   validate:
-    uses: mozilla-it/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
 
   check-pss:
     needs: validate
-    uses: mozilla-it/deploy-actions/.github/workflows/psa-checker.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/psa-checker.yml@main
 ```
 
 ## Example Output

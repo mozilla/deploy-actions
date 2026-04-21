@@ -20,7 +20,7 @@ on:
 
 jobs:
   lint-codeowners:
-    uses: mozilla-it/deploy-actions/.github/workflows/codeowners.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/codeowners.yml@main
     with:
       exclude_dirs: "projects misc modules"  # optional: exclude specific directories
 ```
