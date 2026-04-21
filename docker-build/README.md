@@ -82,7 +82,7 @@ This example demonstrates how to build a Docker container image for a service na
 - Tagged so that it can be published to both Google Artifact Registry and GitHub Container Registry.
 
 ```yaml
-- uses: mozilla-it/deploy-actions/docker-build@v4
+- uses: mozilla/deploy-actions/docker-build@v4
   with:
     image_name: my-service
     gar_name: tenant-prod

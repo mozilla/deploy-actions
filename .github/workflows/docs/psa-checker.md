@@ -30,11 +30,11 @@ on:
 
 jobs:
   validate:
-    uses: mozilla-it/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
 
   check-pss:
     needs: validate
-    uses: mozilla-it/deploy-actions/.github/workflows/psa-checker.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/psa-checker.yml@main
 ```
 
 ### Custom PSS level
@@ -49,11 +49,11 @@ on:
 
 jobs:
   validate:
-    uses: mozilla-it/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/validate-k8s-manifests.yml@main
 
   check-pss:
     needs: validate
-    uses: mozilla-it/deploy-actions/.github/workflows/psa-checker.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/psa-checker.yml@main
     with:
       pss_level: baseline
 ```

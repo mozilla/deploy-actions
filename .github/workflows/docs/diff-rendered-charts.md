@@ -22,7 +22,7 @@ on:
 
 jobs:
   diff-charts:
-    uses: mozilla-it/deploy-actions/.github/workflows/diff-rendered-charts.yml@main
+    uses: mozilla/deploy-actions/.github/workflows/diff-rendered-charts.yml@main
 ```
 
 ## Example Output
