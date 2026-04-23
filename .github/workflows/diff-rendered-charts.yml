@@ -3,7 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Reusable workflow to render and diff helm charts between the head and base ref of a pull request
-# A comment is made on the pull request containing the diff output
+# The diff output is posted as a job summary
 
 name: render and diff helm charts
 on:
@@ -123,58 +123,90 @@ jobs:
           done
         env:
           CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
-      - name: post diff as comment on pull request
+      - name: classify diff
+        id: classify_diff
         if: needs.get_changed_helm_charts.outputs.charts != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        run: |
+          if [ ! -f diff.log ]; then
+            echo "diff.log not found"
+            exit 0
+          fi
+          max_size=$((1024 * 1024))
+          comment_limit=65000
+          file_size=$(stat --format=%s diff.log)
+          if [ "$file_size" -gt "$max_size" ]; then
+            echo "diff_too_large=true" >> "$GITHUB_OUTPUT"
+            echo "diff_fits_in_comment=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "diff_too_large=false" >> "$GITHUB_OUTPUT"
+            if [ "$file_size" -le "$comment_limit" ]; then
+              echo "diff_fits_in_comment=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "diff_fits_in_comment=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: post diff as comment
+        if: steps.classify_diff.outputs.diff_fits_in_comment == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          {
+            echo "Helm chart changes detected."
+            echo ""
+            echo "<details><summary>Show Diff</summary>"
+            echo ""
+            echo '```diff'
+            cat diff.log
+            echo '```'
+            echo ""
+            echo "</details>"
+          } > comment_body.txt
+          gh pr comment "$PR_NUMBER" --body-file comment_body.txt
+          echo "Changes found in Helm charts." >> "$GITHUB_STEP_SUMMARY"
+          echo '<details><summary>Show Output</summary>' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+          cat diff.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: post diff as job summary
+        if: steps.classify_diff.outputs.diff_fits_in_comment == 'false' && steps.classify_diff.outputs.diff_too_large == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          echo "Changes found in Helm charts." >> "$GITHUB_STEP_SUMMARY"
+          echo '<details><summary>Show Output</summary>' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+          cat diff.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh pr comment "$PR_NUMBER" --body "Helm chart changes detected. View the diff in the [job summary](${run_url})."
+
+      - name: upload diff artifact
+        id: upload_artifact
+        if: steps.classify_diff.outputs.diff_too_large == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f #v6.0.0
         with:
-          script: |
-            const fs = require('fs');
-            const comment_char_limit = 65536; // GitHub comment character limit
-            const diff_file = 'diff.log';
+          name: helm-diff
+          path: diff.log
 
-            if (fs.existsSync(diff_file)) {
-              var diff = fs.readFileSync(diff_file, 'utf8');
-            } else {
-              console.log(diff_file + " not found")
-              return
-            }
-
-            function splitComment(comment, maxSize, sepEnd, sepStart, comStart) {
-              // Adapted from Atlantis SplitComment function
-              // https://github.com/runatlantis/atlantis/blob/main/server/events/vcs/common/common.go#L18
-              if (comment.length <= (comment_char_limit - comStart.length)) {
-                return [comStart + diff]
-              }
-              maxWithSep = comment_char_limit - sepEnd.length - sepStart.length;
-              var comments = [];
-              var numComments = Math.ceil(comment.length / maxWithSep);
-              for (var i = 0; i < numComments; i++) {
-                var upTo = Math.min(comment.length, (i + 1) * maxWithSep);
-                var portion = comment.slice(i * maxWithSep, upTo);
-                if (i < numComments - 1) {
-                  portion += sepEnd;
-                }
-                if (i > 0) {
-                  portion = sepStart + portion
-                } else {
-                  portion = comStart + portion
-                }
-                comments.push(portion);
-              }
-              return comments;
-            }
-
-            var sepEnd = "\n```\n</details>" + "\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment.";
-            var sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-            var comStart = "Changes found in Helm charts.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-
-            comments = splitComment(diff, comment_char_limit, sepEnd, sepStart, comStart);
-
-            for (const comment of comments) {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment
-              })
-            }
+      - name: post artifact link
+        if: steps.classify_diff.outputs.diff_too_large == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+          ARTIFACT_URL: ${{ steps.upload_artifact.outputs.artifact-url }}
+        run: |
+          echo "Changes found in Helm charts." >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Diff output exceeds 1MiB and is too large to display inline. [Download the helm-diff artifact](${ARTIFACT_URL}) to view the full diff." >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment "$PR_NUMBER" --body "Helm chart changes detected. The diff is too large to display inline. [Download the helm-diff artifact](${ARTIFACT_URL}) to view the full diff."
