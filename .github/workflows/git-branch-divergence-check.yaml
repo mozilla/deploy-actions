@@ -13,10 +13,13 @@ jobs:
   git-branch-divergence-check:
     name: Git Branch Divergence Check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           fetch-depth: 0  # Full history required to compute merge-base correctly.
           # Use the PR head SHA, not the default synthetic merge commit, so the
           # merge-base calculation reflects the actual branch divergence point.
