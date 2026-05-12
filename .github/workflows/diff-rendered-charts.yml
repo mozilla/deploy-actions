@@ -272,6 +272,7 @@ jobs:
         id: conftest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash {0}
         run: |
           set -uo pipefail
 
@@ -287,7 +288,10 @@ jobs:
             echo "STATUS_STATE=failure" >> "$GITHUB_OUTPUT"
           fi
 
+          exit "${CONFTEST_EXIT_CODE}"
+
       - name: set commit status
+        if: always()
         env:
           STATUS_DESCRIPTION: ${{ steps.conftest.outputs.STATUS_DESCRIPTION }}
           STATUS_STATE: ${{ steps.conftest.outputs.STATUS_STATE }}
