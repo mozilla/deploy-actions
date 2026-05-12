@@ -1,0 +1,76 @@
+name: Git Branch Divergence Check
+# Blocks merging a PR when origin/main has landed commits to the same top-level
+# directory since the branch diverged, preventing silent overwrites of intervening changes.
+
+on:
+  pull_request: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  git-branch-divergence-check:
+    name: Git Branch Divergence Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # Full history required to compute merge-base correctly.
+          # Use the PR head SHA, not the default synthetic merge commit, so the
+          # merge-base calculation reflects the actual branch divergence point.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch origin/main
+        run: |
+          # Re-authenticate the remote so fetch works for private repos and forks.
+          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+          git fetch origin main
+
+      - name: Check for branch divergence
+        run: |
+          # The commit where this PR branch diverged from main.
+          MERGE_BASE=$(git merge-base HEAD origin/main)
+
+          # Capture the top-level directory for any changed tracked file, at any depth.
+          # Dotdirs (.github/, .claude/) are excluded; gitignored paths are excluded
+          # implicitly because git diff only reports tracked files.
+          ROOTS=$(git diff --name-only "${MERGE_BASE}" HEAD \
+            | awk -F'/' 'NF > 1 && $1 !~ /^\./ { print $1 }' \
+            | sort -u)
+
+          if [ -z "$ROOTS" ]; then
+            echo "No tracked roots touched by this PR. Guard not applicable."
+            exit 0
+          fi
+
+          echo "Roots touched by this PR:"
+          echo "$ROOTS"
+          echo ""
+
+          DIVERGED=false
+          while IFS= read -r root; do
+            NEWER=$(git log --oneline "${MERGE_BASE}..origin/main" -- "${root}/")
+            if [ -n "$NEWER" ]; then
+              echo "::error::Branch divergence detected: '$root'"
+              echo "  origin/main has commits in this path since the branch diverged."
+              echo "  Please rebase or merge main into your branch before merging this PR."
+              echo "  Blocking commits:"
+              git log --oneline "${MERGE_BASE}..origin/main" -- "${root}/" | sed 's/^/    /'
+              echo ""
+              DIVERGED=true
+            else
+              echo "OK: '$root' is current with main."
+            fi
+          done <<< "$ROOTS"
+
+          if [ "${DIVERGED}" = "true" ]; then
+            exit 1
+          fi
+
+          echo ""
+          echo "All touched roots are up to date with main."
