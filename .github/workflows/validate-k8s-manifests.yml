@@ -21,7 +21,7 @@ env:
   KUBECONFORM_SHA256: "c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3"
   KUBECONFORM_BASE_URL: "https://github.com/yannh/kubeconform/releases/download"
   KUBECONFORM_SCHEMA_LOCATION: "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
-  KUBECONFORM_CUSTOM_SCHEMA_LOCATION: "https://raw.githubusercontent.com/mozilla/mozcloud/main/crdSchemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+  KUBECONFORM_CUSTOM_SCHEMA_LOCATION: "https://storage.googleapis.com/moz-fx-platform-shared-global-mozcloud-tools/crdSchemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
 jobs:
   get_changed_helm_charts:
