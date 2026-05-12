@@ -275,7 +275,7 @@ jobs:
         run: |
           set -uo pipefail
 
-          CONFTEST_OUTPUT=$(conftest test --no-color --no-fail --strict --update https://raw.githubusercontent.com/mozilla/helm-charts/main/policy/helm-automerge.rego diff)
+          CONFTEST_OUTPUT=$(conftest test --no-color --strict --update https://raw.githubusercontent.com/mozilla/helm-charts/main/policy/helm-automerge.rego diff)
           CONFTEST_EXIT_CODE=$?
           STATUS_DESCRIPTION=$(echo "$CONFTEST_OUTPUT" | tail -1)
 
