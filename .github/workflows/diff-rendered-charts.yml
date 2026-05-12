@@ -240,12 +240,19 @@ jobs:
           shopt -s nullglob
 
           for chart in ${CHARTS}; do
+            # When adding or removing a values file the `render_charts` job will only render one side of the chart to be compared
+            # Create the directory to be compared if it doesn't exist so `find` succeeds
+            mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
+
             CONFIGS=`find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs --null basename -a | sort | uniq`
 
             mkdir -p diff/${chart}
 
             for config in ${CONFIGS}; do
               for dir in "shared/base-charts/${chart}/${config}" "shared/head-charts/${chart}/${config}"; do
+                # Create the directory to be compared if it doesn't exist so `find` succeeds
+                mkdir -p "${dir}"
+
                 OUTPUT_FILE="${dir}.yaml"
 
                 touch "$OUTPUT_FILE"
