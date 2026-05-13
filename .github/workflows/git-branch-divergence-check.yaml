@@ -3,6 +3,7 @@ name: Git Branch Divergence Check
 # directory since the branch diverged, preventing silent overwrites of intervening changes.
 
 on:
+  workflow_call: {}
   pull_request: {}
 
 concurrency:
