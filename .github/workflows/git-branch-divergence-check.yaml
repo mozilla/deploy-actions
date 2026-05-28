@@ -36,10 +36,12 @@ jobs:
       - name: Open check_run on PR head
         id: check
         if: github.event_name == 'issue_comment'
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           CHECK_ID=$(gh api repos/${{ github.repository }}/check-runs \
             -f name="git-branch-divergence-check / Git Branch Divergence Check" \
-            -f head_sha="${{ steps.pr.outputs.head_sha }}" \
+            -f head_sha="${HEAD_SHA}" \
             -f status=in_progress \
             --jq .id)
           echo "check_id=${CHECK_ID}" >> "$GITHUB_OUTPUT"
@@ -108,13 +110,16 @@ jobs:
       # otherwise it would stay "in_progress" indefinitely and block the PR.
       - name: Finalize check_run
         if: always() && github.event_name == 'issue_comment'
+        env:
+          DIVERGENCE_OUTCOME: ${{ steps.divergence.outcome }}
+          CHECK_ID: ${{ steps.check.outputs.check_id }}
         run: |
-          if [ "${{ steps.divergence.outcome }}" = "success" ]; then
+          if [ "${DIVERGENCE_OUTCOME}" = "success" ]; then
             CONCLUSION=success
           else
             CONCLUSION=failure
           fi
-          gh api repos/${{ github.repository }}/check-runs/${{ steps.check.outputs.check_id }} \
+          gh api repos/${{ github.repository }}/check-runs/${CHECK_ID} \
             -X PATCH \
             -f status=completed \
             -f conclusion="${CONCLUSION}"
