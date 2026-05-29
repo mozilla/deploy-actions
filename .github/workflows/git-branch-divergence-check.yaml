@@ -30,8 +30,16 @@ jobs:
           fi
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
-      # issue_comment runs auto-associate with the default-branch HEAD, so the
-      # ruleset can't see the check — POST one on the PR head SHA so it does.
+      # A workflow run triggered by `issue_comment` attaches to the default branch's
+      # HEAD, not the PR's commit, so it never surfaces as a check on the PR and branch
+      # protection can't require it. Create a check run pinned to the PR head SHA
+      # (POST /check-runs, status=in_progress) so the result shows on the PR and can
+      # gate merging. The returned id is reused by "Finalize check_run" below.
+      #
+      # Reference:
+      # - https://stackoverflow.com/questions/59518627/github-action-for-issue-comment-doesnt-shown-in-checks-for-pr
+      # - https://github.com/orgs/community/discussions/25917#discussioncomment-3249667 
+      # - https://github.com/orgs/community/discussions/25141
       - name: Open check_run on PR head
         id: check
         if: github.event_name == 'issue_comment'
@@ -105,8 +113,14 @@ jobs:
           echo ""
           echo "All touched roots are up to date with main."
 
-      # `always()` finalizes the check_run on divergence failure too;
-      # otherwise it would stay "in_progress" indefinitely and block the PR.
+      # Move the check run to status=completed with a success/failure conclusion
+      # (PATCH /check-runs/{id}); the API requires a conclusion once completed.
+      # `always()` runs this even when the divergence step fails — otherwise the
+      # check would stay "in_progress" forever and block the PR.
+      #
+      # Reference:
+      # - https://github.com/orgs/community/discussions/25789#discussioncomment-3249273
+      # - https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
       - name: Finalize check_run
         if: always() && github.event_name == 'issue_comment'
         env:
