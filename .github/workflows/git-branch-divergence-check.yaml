@@ -6,7 +6,6 @@ name: Git Branch Divergence Check
 
 on:
   workflow_call: {}
-  pull_request: {}
 
 jobs:
   git-branch-divergence-check:
