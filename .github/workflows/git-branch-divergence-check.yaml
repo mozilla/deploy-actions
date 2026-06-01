@@ -1,10 +1,11 @@
 name: Git Branch Divergence Check
 # Blocks merging a PR when origin/main has landed commits to the same top-level
 # directory since the branch diverged, preventing silent overwrites of intervening changes.
+# Handles pull_request, merge_group, and (via workflow_call from a caller) issue_comment
+# events through a single job.
 
 on:
   workflow_call: {}
-  pull_request: {}
 
 jobs:
   git-branch-divergence-check:
@@ -12,15 +13,54 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
+      checks: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Resolve PR head SHA
+        id: pr
+        run: |
+          if [ -n "${PR_NUMBER}" ]; then
+            HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          else
+            # merge_group or other event without a PR number — fall through to github.ref
+            HEAD_SHA=""
+          fi
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      # A workflow run triggered by `issue_comment` attaches to the default branch's
+      # HEAD, not the PR's commit, so it never surfaces as a check on the PR and branch
+      # protection can't require it. Create a check run pinned to the PR head SHA
+      # (POST /check-runs, status=in_progress) so the result shows on the PR and can
+      # gate merging. The returned id is reused by "Finalize check_run" below.
+      #
+      # Reference:
+      # - https://stackoverflow.com/questions/59518627/github-action-for-issue-comment-doesnt-shown-in-checks-for-pr
+      # - https://github.com/orgs/community/discussions/25917#discussioncomment-3249667 
+      # - https://github.com/orgs/community/discussions/25141
+      - name: Open check_run on PR head
+        id: check
+        if: github.event_name == 'issue_comment'
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          CHECK_ID=$(gh api repos/${{ github.repository }}/check-runs \
+            -f name="git-branch-divergence-check / Git Branch Divergence Check" \
+            -f head_sha="${HEAD_SHA}" \
+            -f status=in_progress \
+            --jq .id)
+          echo "check_id=${CHECK_ID}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 0  # Full history required to compute merge-base correctly.
-          # Use the PR head SHA, not the default synthetic merge commit, so the
-          # merge-base calculation reflects the actual branch divergence point.
-          ref: ${{ github.event.pull_request.head.sha }}
+          # Use the resolved PR head SHA when available; falls back to github.ref
+          # for merge_group events (which use a special merge queue ref).
+          ref: ${{ steps.pr.outputs.head_sha || github.ref }}
 
       - name: Fetch origin/main
         run: |
@@ -29,6 +69,7 @@ jobs:
           git fetch origin main
 
       - name: Check for branch divergence
+        id: divergence
         run: |
           # The commit where this PR branch diverged from main.
           MERGE_BASE=$(git merge-base HEAD origin/main)
@@ -71,3 +112,27 @@ jobs:
 
           echo ""
           echo "All touched roots are up to date with main."
+
+      # Move the check run to status=completed with a success/failure conclusion
+      # (PATCH /check-runs/{id}); the API requires a conclusion once completed.
+      # `always()` runs this even when the divergence step fails — otherwise the
+      # check would stay "in_progress" forever and block the PR.
+      #
+      # Reference:
+      # - https://github.com/orgs/community/discussions/25789#discussioncomment-3249273
+      # - https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
+      - name: Finalize check_run
+        if: always() && github.event_name == 'issue_comment'
+        env:
+          DIVERGENCE_OUTCOME: ${{ steps.divergence.outcome }}
+          CHECK_ID: ${{ steps.check.outputs.check_id }}
+        run: |
+          if [ "${DIVERGENCE_OUTCOME}" = "success" ]; then
+            CONCLUSION=success
+          else
+            CONCLUSION=failure
+          fi
+          gh api repos/${{ github.repository }}/check-runs/${CHECK_ID} \
+            -X PATCH \
+            -f status=completed \
+            -f conclusion="${CONCLUSION}"
