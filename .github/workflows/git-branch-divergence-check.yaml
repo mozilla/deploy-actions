@@ -14,7 +14,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      checks: write
+      statuses: write
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
       GH_TOKEN: ${{ github.token }}
@@ -31,27 +31,40 @@ jobs:
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
       # A workflow run triggered by `issue_comment` attaches to the default branch's
-      # HEAD, not the PR's commit, so it never surfaces as a check on the PR and branch
-      # protection can't require it. Create a check run pinned to the PR head SHA
-      # (POST /check-runs, status=in_progress) so the result shows on the PR and can
-      # gate merging. The returned id is reused by "Finalize check_run" below.
+      # HEAD, not the PR's commit, so the job's own check never surfaces on the PR and
+      # branch protection can't require it. We therefore report the result against the
+      # PR head SHA ourselves.
+      #
+      # We use the Commit Statuses API deliberately. A check run
+      # created with the default GITHUB_TOKEN cannot choose its check suite — GitHub
+      # grafts it onto an existing github-actions[bot] suite on that commit. If the PR
+      # was closed/reopened (or pushed) since, a newer check suite exists in which this
+      # check ran green, and required-status resolution favors the newest suite — so a
+      # failure stranded in the older suite gets silently shadowed and the PR shows
+      # green. Commit statuses have no suite concept: for a given context the latest
+      # status by time always wins, so a later failure can never be shadowed.
+      #
+      # Post a `pending` status up front for UX; the status is keyed by (sha, context),
+      # so there is no id to capture.
       #
       # Reference:
       # - https://stackoverflow.com/questions/59518627/github-action-for-issue-comment-doesnt-shown-in-checks-for-pr
-      # - https://github.com/orgs/community/discussions/25917#discussioncomment-3249667 
-      # - https://github.com/orgs/community/discussions/25141
-      - name: Open check_run on PR head
-        id: check
+      # - https://docs.github.com/en/rest/commits/statuses
+      # - https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks
+      - name: Set pending status on PR head
         if: github.event_name == 'issue_comment'
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
-          CHECK_ID=$(gh api repos/${{ github.repository }}/check-runs \
-            -f name="git-branch-divergence-check / Git Branch Divergence Check" \
-            -f head_sha="${HEAD_SHA}" \
-            -f status=in_progress \
-            --jq .id)
-          echo "check_id=${CHECK_ID}" >> "$GITHUB_OUTPUT"
+          if [ -z "${HEAD_SHA}" ]; then
+            echo "::error::Could not resolve PR head SHA; cannot post commit status."
+            exit 1
+          fi
+          gh api repos/${{ github.repository }}/statuses/${HEAD_SHA} \
+            -f state=pending \
+            -f context="git-branch-divergence-check/recheck" \
+            -f description="Checking branch divergence..." \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -113,26 +126,32 @@ jobs:
           echo ""
           echo "All touched roots are up to date with main."
 
-      # Move the check run to status=completed with a success/failure conclusion
-      # (PATCH /check-runs/{id}); the API requires a conclusion once completed.
+      # Post the final commit status (success/failure) against the PR head SHA.
       # `always()` runs this even when the divergence step fails — otherwise the
-      # check would stay "in_progress" forever and block the PR.
+      # status would stay "pending" forever and block the PR.
       #
       # Reference:
-      # - https://github.com/orgs/community/discussions/25789#discussioncomment-3249273
+      # - https://docs.github.com/en/rest/commits/statuses
       # - https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
-      - name: Finalize check_run
+      - name: Set final status on PR head
         if: always() && github.event_name == 'issue_comment'
         env:
           DIVERGENCE_OUTCOME: ${{ steps.divergence.outcome }}
-          CHECK_ID: ${{ steps.check.outputs.check_id }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
-          if [ "${DIVERGENCE_OUTCOME}" = "success" ]; then
-            CONCLUSION=success
-          else
-            CONCLUSION=failure
+          if [ -z "${HEAD_SHA}" ]; then
+            echo "::error::Could not resolve PR head SHA; cannot post commit status."
+            exit 1
           fi
-          gh api repos/${{ github.repository }}/check-runs/${CHECK_ID} \
-            -X PATCH \
-            -f status=completed \
-            -f conclusion="${CONCLUSION}"
+          if [ "${DIVERGENCE_OUTCOME}" = "success" ]; then
+            STATE=success
+            DESCRIPTION="Branch is current with main."
+          else
+            STATE=failure
+            DESCRIPTION="Branch divergence detected; rebase or merge main."
+          fi
+          gh api repos/${{ github.repository }}/statuses/${HEAD_SHA} \
+            -f state="${STATE}" \
+            -f context="git-branch-divergence-check/recheck" \
+            -f description="${DESCRIPTION}" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
