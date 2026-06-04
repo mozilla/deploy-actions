@@ -17,6 +17,7 @@ jobs:
       statuses: write
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      MERGE_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Resolve PR head SHA
@@ -24,8 +25,11 @@ jobs:
         run: |
           if [ -n "${PR_NUMBER}" ]; then
             HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          elif [ -n "${MERGE_GROUP_SHA}" ]; then
+            # merge_group event: report against the merge-queue commit GitHub evaluates.
+            HEAD_SHA="${MERGE_GROUP_SHA}"
           else
-            # merge_group or other event without a PR number — fall through to github.ref
+            # No PR number and not a merge_group — fall through to github.ref
             HEAD_SHA=""
           fi
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
@@ -40,6 +44,11 @@ jobs:
       # automatically on each push — otherwise a PR that never receives an
       # `atlantis plan` comment would have no `recheck` status and stay blocked under
       # strict required-status rules.
+      #
+      # We post it on `merge_group` events too, keyed to the merge-queue commit
+      # (`github.event.merge_group.head_sha`). The merge queue evaluates the same
+      # required contexts against that commit, so without this the queue would hang
+      # waiting for a `recheck` status that never arrives.
       #
       # We use the Commit Statuses API deliberately. A check run
       # created with the default GITHUB_TOKEN cannot choose its check suite — GitHub
@@ -58,7 +67,7 @@ jobs:
       # - https://docs.github.com/en/rest/commits/statuses
       # - https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks
       - name: Set pending status on PR head
-        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request'
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request' || github.event_name == 'merge_group'
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
@@ -140,7 +149,7 @@ jobs:
       # - https://docs.github.com/en/rest/commits/statuses
       # - https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
       - name: Set final status on PR head
-        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'pull_request')
+        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'pull_request' || github.event_name == 'merge_group')
         env:
           DIVERGENCE_OUTCOME: ${{ steps.divergence.outcome }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
