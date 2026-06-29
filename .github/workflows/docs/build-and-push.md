@@ -13,7 +13,6 @@ See their documentation for more details on some of these inputs.
 - Provides an optional hook to run a `postbuild_script` after building (e.g. for running tests)
 - Pushes the image to GCP Artifact Registry (and optionally GitHub Container Registry) using [`docker-push`]
 
-
 ## Inputs
 
 | Name                                    | Required | Type    | Description                                                                                                     |
@@ -22,7 +21,7 @@ See their documentation for more details on some of these inputs.
 | `gar_name`                              | true     | string  | Name of the GAR repository. (typically `<tenant>-prod`)                                                         |
 | `project_id`                            | true     | string  | GCP project ID where the Artifact Registry is located. (typically `moz-fx-<tenant>-prod`)                       |
 | `workload_identity_pool_project_number` | false    | string  | GCP workload identity pool project number. (default: `${{ vars.GCPV2_WORKLOAD_IDENTITY_POOL_PROJECT_NUMBER }}`) |
-| `prebuild_script`                       | false    | string  | Shell script (either inline or path to script) to run before building the image. (default: *see below)*         |
+| `prebuild_script`                       | false    | string  | Shell script (either inline or path to script) to run before building the image. (default: _see below)_         |
 | `postbuild_script`                      | false    | string  | Shell script (either inline or path to script) to run after building the image.                                 |
 | `image_build_context`                   | false    | string  | Build context path. Default value is relative to the repository root. (default: `"./"`)                         |
 | `dockerfile_path`                       | false    | string  | Path to Dockerfile. Default value is relative to the repository root. (default: `"./Dockerfile"`)               |
@@ -32,6 +31,7 @@ See their documentation for more details on some of these inputs.
 | `gar_location`                          | false    | string  | Artifact Registry location. (default: `"us"`)                                                                   |
 | `service_account_name`                  | false    | string  | GCP service account for pushing to registry. (default: `"artifact-writer"`)                                     |
 | `enable_attestations`                   | false    | boolean | Enable SBOM and provenance attestations for supply chain security. (default: `false`)                           |
+| `push`                                  | false    | boolean | Set to false to validate build steps without pushing to repository. (default: `true`)                           |
 
 ### `enable_attestations`
 
@@ -78,6 +78,7 @@ Postbuild scripts validate the built container image before pushing to registrie
 - **Configuration validation**: Confirm required environment variables and config files are present
 
 For detailed examples and implementation guidance, see:
+
 - [mozilla/cicd-demos/go-demo](https://github.com/mozilla/cicd-demos/tree/main/go-demo) - Reference implementation with prebuild/postbuild scripts
 - [How to: Linting and Testing in Container Builds](https://mozilla-hub.atlassian.net/wiki/spaces/SRE/pages/1920860166/How+to+Linting+and+Testing+in+Container+Builds) - Comprehensive guide to container build validation
 
@@ -90,14 +91,15 @@ For detailed examples and implementation guidance, see:
 ## Usage
 
 ### Minimal configuration
+
 ```yaml
 on:
   push:
     branches:
       - main
     tags:
-      - v20[0-9][0-9].[01][0-9].[0-3][0-9]  # e.g. v2023.12.04
-      - v20[0-9][0-9].[01][0-9].[0-3][0-9]-[0-9]  # e.g. v2023.12.04-2
+      - v20[0-9][0-9].[01][0-9].[0-3][0-9] # e.g. v2023.12.04
+      - v20[0-9][0-9].[01][0-9].[0-3][0-9]-[0-9] # e.g. v2023.12.04-2
 
 jobs:
   build-and-push:
@@ -113,14 +115,15 @@ jobs:
 ```
 
 ### Push to GHCR
+
 ```yaml
 on:
   push:
     branches:
       - main
     tags:
-      - v20[0-9][0-9].[01][0-9].[0-3][0-9]  # e.g. v2023.12.04
-      - v20[0-9][0-9].[01][0-9].[0-3][0-9]-[0-9]  # e.g. v2023.12.04-2
+      - v20[0-9][0-9].[01][0-9].[0-3][0-9] # e.g. v2023.12.04
+      - v20[0-9][0-9].[01][0-9].[0-3][0-9]-[0-9] # e.g. v2023.12.04-2
 
 jobs:
   build:

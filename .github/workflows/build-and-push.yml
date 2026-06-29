@@ -69,6 +69,11 @@ on:
         type: boolean
         default: false
         description: Enable SBOM and provenance attestations for supply chain security
+      push:
+        required: false
+        type: boolean
+        default: true
+        description: Set to false to validate build steps without pushing to repository
 
 jobs:
   build-and-push:
@@ -132,6 +137,7 @@ jobs:
             bash "$TMP"
           fi
       - name: Push Container Image
+        if: ${{ inputs.push }}
         uses: mozilla/deploy-actions/docker-push@8d2c17a843ea376c58b4e88e55d1335bafd52bcb #v6.2.0
         with:
           image_tags: ${{ steps.build.outputs.image_tags }}
