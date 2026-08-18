@@ -115,72 +115,366 @@ jobs:
           merge-multiple: true
           path: "shared"
 
-      - name: diff helm charts
-        id: diff_helm_charts
+      # TODO Move this step into a separate action with tool cache support
+      - name: install dyff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for chart in ${CHARTS}; do
-            chart_diff_output=$(diff -r "shared/base-charts/${chart}" "shared/head-charts/${chart}" || true)
-            if [ -n "$chart_diff_output" ]; then
-              echo -e "Changes found in chart: ${chart}\n$(diff -ruN shared/base-charts/${chart} shared/head-charts/${chart})\n" >> diff.log
-            fi
-          done
+          set -euo pipefail
+
+          gh release download v1.12.0 -R homeport/dyff -p "dyff_*_linux_amd64.tar.gz" -O - | tar xzf - dyff
+          mv dyff /usr/local/bin
+
+      - name: diff helm charts
         env:
           CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p diff
+          : > diff/index.tsv
+
+          for chart in ${CHARTS}; do
+            # When adding or removing a values file the `render_charts` job will only render one side of the chart to be compared
+            # Create the directory to be compared if it doesn't exist so `find` succeeds
+            mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
+
+            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs --null -r basename -a | sort | uniq)
+
+            for config in ${CONFIGS}; do
+              for side in base head; do
+                dir="shared/${side}-charts/${chart}/${config}"
+
+                # Create the directory to be compared if it doesn't exist so `find` succeeds
+                mkdir -p "${dir}"
+
+                # Concatenate every rendered manifest for this config into one multi-document YAML.
+                # dyff keys documents on apiVersion/kind/metadata.name, so the order files land in
+                # here has no bearing on how resources are matched between the two sides. This is
+                # what lets the diff survive templates moving to new paths.
+                MANIFEST="${dir}.yaml"
+
+                : > "$MANIFEST"
+
+                find "$dir" -type f | sort | while read -r file; do
+                  cat "$file" >> "$MANIFEST"
+                  echo "" >> "$MANIFEST"  # ensure newline between files
+                done
+              done
+
+              OUTPUT_FILE="diff/${chart}/${config}.diff"
+              mkdir -p "$(dirname "$OUTPUT_FILE")"
+
+              # `--detect-kubernetes` and `--detect-renames` are dyff defaults; passed explicitly
+              # because they are the whole point of using dyff here
+              if ! dyff between \
+                --output github \
+                --omit-header \
+                --ignore-order-changes \
+                --ignore-whitespace-changes \
+                --detect-kubernetes \
+                --detect-renames \
+                "shared/base-charts/${chart}/${config}.yaml" \
+                "shared/head-charts/${chart}/${config}.yaml" > "$OUTPUT_FILE" 2> "${OUTPUT_FILE}.err"; then
+                # Surface the failure in the comment rather than failing the whole job, so one
+                # unparseable config cannot suppress the diff for every other chart
+                { echo "DYFF_ERROR"; cat "${OUTPUT_FILE}.err"; } > "$OUTPUT_FILE"
+              fi
+
+              BASE_DOCS=$(grep -c '^kind:' "shared/base-charts/${chart}/${config}.yaml" || true)
+              HEAD_DOCS=$(grep -c '^kind:' "shared/head-charts/${chart}/${config}.yaml" || true)
+
+              printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$config" "$OUTPUT_FILE" "$BASE_DOCS" "$HEAD_DOCS" >> diff/index.tsv
+            done
+          done
 
       - name: post diff as comment on pull request
         if: needs.get_changed_helm_charts.outputs.charts != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
         with:
           script: |
             const fs = require('fs');
-            const comment_char_limit = 65536; // GitHub comment character limit
-            const diff_file = 'diff.log';
 
-            if (fs.existsSync(diff_file)) {
-              var diff = fs.readFileSync(diff_file, 'utf8');
-            } else {
-              console.log(diff_file + " not found")
-              return
+            const COMMENT_CHAR_LIMIT = 65536; // GitHub comment character limit
+            const MAX_LISTED_RESOURCES = 25;  // per category, before collapsing to a count
+            // Identifies our own comments so superseded ones can be folded away on the next push
+            const MARKER = '<!-- mozilla/deploy-actions:diff-rendered-charts -->';
+            const INDEX_FILE = 'diff/index.tsv';
+
+            // Fold away diffs from previous pushes, the way the Atlantis bot hides stale plans.
+            // They stay in the timeline but collapse, so a long-lived migration PR does not
+            // accumulate pages of dead output.
+            async function hideSupersededComments() {
+              const existing = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+
+              for (const comment of existing.filter((c) => (c.body || '').includes(MARKER))) {
+                try {
+                  await github.graphql(
+                    `mutation($id: ID!) {
+                       minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+                         clientMutationId
+                       }
+                     }`,
+                    { id: comment.node_id },
+                  );
+                } catch (error) {
+                  core.warning(`Could not minimize comment ${comment.id}: ${error.message}`);
+                }
+              }
             }
 
-            function splitComment(comment, maxSize, sepEnd, sepStart, comStart) {
-              // Adapted from Atlantis SplitComment function
-              // https://github.com/runatlantis/atlantis/blob/main/server/events/vcs/common/common.go#L18
-              if (comment.length <= (comment_char_limit - comStart.length)) {
-                return [comStart + diff]
-              }
-              maxWithSep = comment_char_limit - sepEnd.length - sepStart.length;
-              var comments = [];
-              var numComments = Math.ceil(comment.length / maxWithSep);
-              for (var i = 0; i < numComments; i++) {
-                var upTo = Math.min(comment.length, (i + 1) * maxWithSep);
-                var portion = comment.slice(i * maxWithSep, upTo);
-                if (i < numComments - 1) {
-                  portion += sepEnd;
+            // dyff's github output is a sequence of blocks:
+            //
+            //   @@ <path> @@
+            //   # <apiVersion>/<Kind>/<name>
+            //   ! <description of the change>
+            //   +/- <values>
+            //
+            // A path of `(root level)` paired with a document added/removed description means the
+            // resource as a whole appeared or disappeared; anything else is a field-level change.
+            function parseDyff(text) {
+              const resources = new Map();
+              let changeCount = 0;
+              let currentPath = null;
+              let currentResource = null;
+
+              for (const line of text.split('\n')) {
+                const pathMatch = line.match(/^@@ (.*) @@$/);
+                const resourceMatch = line.match(/^# (.+)$/);
+                const detailMatch = line.match(/^! (.+)$/);
+
+                if (pathMatch) {
+                  currentPath = pathMatch[1];
+                  currentResource = null;
+                  changeCount += 1;
+                } else if (resourceMatch && currentPath !== null) {
+                  currentResource = resourceMatch[1];
+                  if (!resources.has(currentResource)) {
+                    resources.set(currentResource, { added: false, removed: false });
+                  }
+                } else if (detailMatch && currentResource !== null) {
+                  const isRootLevel = currentPath === '(root level)';
+                  if (isRootLevel && /one document added/.test(detailMatch[1])) {
+                    resources.get(currentResource).added = true;
+                  }
+                  if (isRootLevel && /one document removed/.test(detailMatch[1])) {
+                    resources.get(currentResource).removed = true;
+                  }
                 }
-                if (i > 0) {
-                  portion = sepStart + portion
-                } else {
-                  portion = comStart + portion
-                }
-                comments.push(portion);
               }
+
+              const added = [];
+              const removed = [];
+              const updated = [];
+              for (const [id, flags] of resources) {
+                if (flags.added) added.push(id);
+                else if (flags.removed) removed.push(id);
+                else updated.push(id);
+              }
+
+              return {
+                changeCount,
+                resourceCount: resources.size,
+                added: added.sort(),
+                removed: removed.sort(),
+                updated: updated.sort(),
+              };
+            }
+
+            // Cross-check the classification against the document counts recorded by the diff
+            // step: the net change in document count must equal added minus removed. parseDyff
+            // keys on dyff's own wording ("one document added"), so if that wording ever changes
+            // every resource would quietly fall into Updated and the summary would mislead while
+            // still looking plausible. This turns that silent drift into a warning.
+            function checkDocumentCounts(entry, parsed) {
+              const recorded = Number(entry.headDocs) - Number(entry.baseDocs);
+              const classified = parsed.added.length - parsed.removed.length;
+
+              if (Number.isFinite(recorded) && recorded !== classified) {
+                core.warning(
+                  `${entry.chart} / ${entry.config}: rendered document count changed by ` +
+                    `${recorded}, but ${parsed.added.length} added and ${parsed.removed.length} ` +
+                    `removed account for ${classified}. The added/removed/updated summary may be ` +
+                    `inaccurate; the diff itself is unaffected.`,
+                );
+              }
+            }
+
+            function renderResourceList(label, ids) {
+              if (ids.length === 0) return '';
+
+              const shown = ids.slice(0, MAX_LISTED_RESOURCES);
+              const lines = shown.map((id) => `- \`${id}\``);
+              if (ids.length > shown.length) {
+                lines.push(`- ...and ${ids.length - shown.length} more`);
+              }
+
+              return `**${label} (${ids.length})**\n${lines.join('\n')}\n\n`;
+            }
+
+            function renderSummary(entry, parsed) {
+              let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
+              body += `**${parsed.changeCount} ${parsed.changeCount === 1 ? 'change' : 'changes'}`;
+              body += ` across ${parsed.resourceCount}`;
+              body += ` ${parsed.resourceCount === 1 ? 'resource' : 'resources'}**`;
+              body += ` (${entry.baseDocs} → ${entry.headDocs} documents)\n\n`;
+              body += renderResourceList('Updated', parsed.updated);
+              body += renderResourceList('Added', parsed.added);
+              body += renderResourceList('Removed', parsed.removed);
+              return body;
+            }
+
+            function renderDiffBlock(entry, diff) {
+              return [
+                `<details><summary>Show full diff for <code>${entry.chart}</code> / <code>${entry.config}</code></summary>`,
+                '',
+                '```diff',
+                diff.trimEnd(),
+                '```',
+                '</details>',
+                '',
+              ].join('\n');
+            }
+
+            // Pack pre-rendered chunks into as few comments as possible, splitting any single
+            // chunk that cannot fit on its own.
+            function packComments(header, chunks) {
+              const continued = 'Continued from previous comment.\n\n';
+              const comments = [];
+              let current = header;
+
+              const flush = () => {
+                if (current.trim().length > 0) comments.push(current);
+                current = continued;
+              };
+
+              for (const chunk of chunks) {
+                if (current.length + chunk.length <= COMMENT_CHAR_LIMIT) {
+                  current += chunk;
+                  continue;
+                }
+
+                flush();
+
+                if (chunk.length + continued.length <= COMMENT_CHAR_LIMIT) {
+                  current += chunk;
+                  continue;
+                }
+
+                // Chunk is too large even alone. Split it on line boundaries so the fenced
+                // block stays coherent, reopening the fence in each continuation.
+                const notice = '\n```\n\n**Note**: output exceeds the maximum comment size, continued in the next comment.';
+                const reopen = continued + '```diff\n';
+                const budget = COMMENT_CHAR_LIMIT - reopen.length - notice.length;
+
+                let buffer = '';
+                for (const line of chunk.split('\n')) {
+                  if (buffer.length + line.length + 1 > budget) {
+                    comments.push(current + buffer + notice);
+                    current = reopen;
+                    buffer = '';
+                  }
+                  buffer += line + '\n';
+                }
+                current += buffer;
+              }
+
+              flush();
               return comments;
             }
 
-            var sepEnd = "\n```\n</details>" + "\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment.";
-            var sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-            var comStart = "Changes found in Helm charts.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
+            if (!fs.existsSync(INDEX_FILE)) {
+              console.log(`${INDEX_FILE} not found, nothing to report`);
+              return;
+            }
 
-            comments = splitComment(diff, comment_char_limit, sepEnd, sepStart, comStart);
+            const entries = fs
+              .readFileSync(INDEX_FILE, 'utf8')
+              .split('\n')
+              .filter((line) => line.trim().length > 0)
+              .map((line) => {
+                const [chart, config, diffPath, baseDocs, headDocs] = line.split('\t');
+                return { chart, config, diffPath, baseDocs, headDocs };
+              });
 
-            for (const comment of comments) {
+            const changed = [];
+            const failed = [];
+            const unchanged = [];
+
+            for (const entry of entries) {
+              const diff = fs.existsSync(entry.diffPath)
+                ? fs.readFileSync(entry.diffPath, 'utf8')
+                : '';
+
+              if (diff.startsWith('DYFF_ERROR')) {
+                failed.push({ entry, message: diff.replace(/^DYFF_ERROR\n?/, '') });
+              } else if (diff.trim().length > 0) {
+                const parsed = parseDyff(diff);
+                checkDocumentCounts(entry, parsed);
+                changed.push({ entry, diff, parsed });
+              } else {
+                unchanged.push(entry);
+              }
+            }
+
+            await hideSupersededComments();
+
+            if (changed.length === 0 && failed.length === 0) {
               await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: comment
-              })
+                body: `${MARKER}\n## Helm chart diff\n\nNo changes to the rendered Kubernetes manifests.`,
+              });
+              return;
+            }
+
+            let header = `${MARKER}\n## Helm chart diff\n\n`;
+            header += 'Rendered manifests compared by resource identity (`apiVersion`, `kind`, `metadata.name`), ';
+            header += 'so resources are matched even when templates move to new paths.\n\n';
+
+            // Call out configs that rendered identically. On a migration PR a no-op config is
+            // the desired outcome, so its absence from the diff should not be left implicit.
+            if (unchanged.length > 0) {
+              const listed = unchanged.map((e) => `\`${e.chart}\` / \`${e.config}\``).join(', ');
+              header += `No changes to the rendered manifests for ${listed}.\n\n`;
+            }
+
+            const chunks = [];
+
+            for (const { entry, message } of failed) {
+              chunks.push(
+                `### \`${entry.chart}\` / \`${entry.config}\`\n\n` +
+                  `Could not produce a diff for this config.\n\n\`\`\`\n${message.trim()}\n\`\`\`\n\n`,
+              );
+            }
+
+            for (const item of changed) {
+              chunks.push(renderSummary(item.entry, item.parsed));
+              chunks.push(renderDiffBlock(item.entry, item.diff));
+            }
+
+            for (const body of packComments(header, chunks)) {
+              // Backstop: packComments keeps bodies under the limit, but never let an
+              // oversized body be rejected by the API without saying so out loud
+              let safe = body;
+              if (safe.length > COMMENT_CHAR_LIMIT) {
+                const truncated = '\n\n**Note**: output truncated to fit the maximum comment size.';
+                safe = safe.slice(0, COMMENT_CHAR_LIMIT - truncated.length) + truncated;
+                core.warning(`Comment body exceeded ${COMMENT_CHAR_LIMIT} characters and was truncated`);
+              }
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: safe,
+              });
             }
 
   evaulate_helm_chart_automerge:
