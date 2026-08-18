@@ -322,23 +322,43 @@ jobs:
                 addedByGroup.get(group).push(nameOf(id));
               }
 
-              const prefixes = new Map();
+              // Length of the shared trailing run of `-` separated segments. Comparing segments
+              // rather than raw strings is what catches a prefix being *replaced* rather than
+              // merely added: `treeherder-web` versus `treeherder-v2-web` share the tail `web`
+              // but neither name is a suffix of the other.
+              const sharedTail = (a, b) => {
+                let n = 0;
+                while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) {
+                  n += 1;
+                }
+                return n;
+              };
+
+              const deltas = new Map();
               for (const id of parsed.removed) {
+                const removed = nameOf(id).split('-');
                 for (const addedName of addedByGroup.get(groupOf(id)) || []) {
-                  const removedName = nameOf(id);
-                  let prefix = null;
-                  if (removedName.endsWith(`-${addedName}`)) {
-                    prefix = removedName.slice(0, -(addedName.length + 1));
-                  } else if (addedName.endsWith(`-${removedName}`)) {
-                    prefix = addedName.slice(0, -(removedName.length + 1));
-                  }
-                  if (prefix) prefixes.set(prefix, (prefixes.get(prefix) || 0) + 1);
+                  const added = addedName.split('-');
+                  const shared = sharedTail(removed, added);
+
+                  // Need a shared tail, and the names must not be identical
+                  if (shared === 0) continue;
+                  if (shared === removed.length && shared === added.length) continue;
+
+                  const from = removed.slice(0, removed.length - shared).join('-');
+                  const to = added.slice(0, added.length - shared).join('-');
+                  if (from === to) continue;
+
+                  const delta = `${from || '(none)'} -> ${to || '(none)'}`;
+                  deltas.set(delta, (deltas.get(delta) || 0) + 1);
                 }
               }
 
+              // Requiring the same delta at least twice keeps this tight: two unrelated
+              // resources would have to disagree in exactly the same way to trigger it.
               let best = null;
-              for (const [prefix, count] of prefixes) {
-                if (count >= 2 && (!best || count > best.count)) best = { prefix, count };
+              for (const [delta, count] of deltas) {
+                if (count >= 2 && (!best || count > best.count)) best = { delta, count };
               }
               return best;
             }
@@ -383,13 +403,15 @@ jobs:
 
               if (mismatch) {
                 body += `> **This diff is probably misleading.** ${mismatch.count} resources appear as `;
-                body += `both added and removed, differing only by the name prefix `;
-                body += `\`${mismatch.prefix}-\`. That usually means the two sides were rendered `;
-                body += `under different Helm release names, so resources that actually correspond `;
-                body += `could not be matched up.\n>\n`;
-                body += `> Charts are rendered under their directory name, which is what Argo CD `;
-                body += `uses unless the tenant config sets \`release_name\`. If this chart has such `;
-                body += `an override, treat the added and removed lists as one set of resources, not two.\n\n`;
+                body += `both added and removed, with names differing only in their prefix `;
+                body += `(\`${mismatch.delta}\`). That usually means the two sides were rendered under `;
+                body += `different Helm release names, so resources that actually correspond could not `;
+                body += `be matched up.\n>\n`;
+                body += `> Charts are rendered under their directory name, which is what Argo CD uses `;
+                body += `unless the tenant config sets \`release_name\`. Migrated charts often name `;
+                body += `resources with the release name baked in, to avoid recreating them, so a chart `;
+                body += `with such an override will diff against a prefix it never uses in production. `;
+                body += `Treat the added and removed lists as one set of resources, not two.\n\n`;
               }
 
               body += renderResourceList('Updated', parsed.updated);
@@ -519,8 +541,8 @@ jobs:
                 const mismatch = detectPrefixMismatch(parsed);
                 if (mismatch) {
                   core.warning(
-                    `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only by ` +
-                      `the name prefix "${mismatch.prefix}-" between the two sides, which suggests ` +
+                    `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only in ` +
+                      `their name prefix (${mismatch.delta}) between the two sides, which suggests ` +
                       `they were rendered under different Helm release names. The diff for this ` +
                       `config is likely misleading.`,
                   );
