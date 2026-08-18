@@ -344,59 +344,89 @@ jobs:
               return body;
             }
 
-            function renderDiffBlock(entry, diff) {
-              return [
-                `<details><summary>Show full diff for <code>${entry.chart}</code> / <code>${entry.config}</code></summary>`,
-                '',
-                '```diff',
-                diff.trimEnd(),
-                '```',
-                '</details>',
-                '',
-              ].join('\n');
+            // Render one slice of a diff, wrapped so that every comment is independently valid:
+            // its own <details> opened and closed, and its own fence opened and closed. An
+            // earlier version reopened only the fence in continuations, which left one comment
+            // with an unclosed <details> and the next with an orphan </details> rendered fully
+            // expanded.
+            function renderDiffPart(entry, body, isContinuation, isFinal) {
+              const suffix = isContinuation ? ' (continued)' : '';
+              let out = `<details><summary>Show full diff for <code>${entry.chart}</code> / <code>${entry.config}</code>${suffix}</summary>\n\n`;
+              out += '```diff\n' + body.replace(/\n+$/, '') + '\n```\n</details>\n\n';
+              if (!isFinal) {
+                out += '**Note**: output exceeds the maximum comment size, continued in the next comment.\n\n';
+              }
+              return out;
             }
 
-            // Pack pre-rendered chunks into as few comments as possible, splitting any single
-            // chunk that cannot fit on its own.
+            // Pack chunks into as few comments as possible. Diff chunks are sliced on line
+            // boundaries when they cannot fit, each slice individually wrapped. Every comment
+            // begins with MARKER so that all of them, not just the first, are found and folded
+            // away on the next push.
             function packComments(header, chunks) {
-              const continued = 'Continued from previous comment.\n\n';
+              const continued = `${MARKER}\nContinued from previous comment.\n\n`;
               const comments = [];
               let current = header;
+              let hasContent = false;
+
+              const append = (text) => {
+                current += text;
+                hasContent = true;
+              };
 
               const flush = () => {
-                if (current.trim().length > 0) comments.push(current);
+                if (hasContent) comments.push(current);
                 current = continued;
+                hasContent = false;
               };
 
               for (const chunk of chunks) {
-                if (current.length + chunk.length <= COMMENT_CHAR_LIMIT) {
-                  current += chunk;
-                  continue;
-                }
-
-                flush();
-
-                if (chunk.length + continued.length <= COMMENT_CHAR_LIMIT) {
-                  current += chunk;
-                  continue;
-                }
-
-                // Chunk is too large even alone. Split it on line boundaries so the fenced
-                // block stays coherent, reopening the fence in each continuation.
-                const notice = '\n```\n\n**Note**: output exceeds the maximum comment size, continued in the next comment.';
-                const reopen = continued + '```diff\n';
-                const budget = COMMENT_CHAR_LIMIT - reopen.length - notice.length;
-
-                let buffer = '';
-                for (const line of chunk.split('\n')) {
-                  if (buffer.length + line.length + 1 > budget) {
-                    comments.push(current + buffer + notice);
-                    current = reopen;
-                    buffer = '';
+                if (chunk.kind === 'text') {
+                  if (hasContent && current.length + chunk.body.length > COMMENT_CHAR_LIMIT) {
+                    flush();
                   }
-                  buffer += line + '\n';
+                  append(chunk.body);
+                  continue;
                 }
-                current += buffer;
+
+                // Overhead is measured with the continuation suffix and the note present, so it
+                // is the worst case and can never under-reserve.
+                const overhead = renderDiffPart(chunk.entry, '', true, false).length;
+                const lines = chunk.diff.replace(/\n+$/, '').split('\n');
+
+                let index = 0;
+                let isContinuation = false;
+
+                while (index < lines.length) {
+                  const available = COMMENT_CHAR_LIMIT - current.length - overhead;
+
+                  // Too little room left to make useful progress; start a fresh comment
+                  if (available < 1024 && hasContent) {
+                    flush();
+                    continue;
+                  }
+
+                  const taken = [];
+                  let used = 0;
+                  while (index < lines.length && used + lines[index].length + 1 <= available) {
+                    used += lines[index].length + 1;
+                    taken.push(lines[index]);
+                    index += 1;
+                  }
+
+                  // A single line longer than a whole comment. Truncate it rather than loop
+                  // forever, and say so.
+                  if (taken.length === 0) {
+                    taken.push(`${lines[index].slice(0, Math.max(1, available - 64))} [line truncated]`);
+                    index += 1;
+                  }
+
+                  const isFinal = index >= lines.length;
+                  append(renderDiffPart(chunk.entry, taken.join('\n'), isContinuation, isFinal));
+                  isContinuation = true;
+
+                  if (!isFinal) flush();
+                }
               }
 
               flush();
@@ -463,15 +493,17 @@ jobs:
             const chunks = [];
 
             for (const { entry, message } of failed) {
-              chunks.push(
-                `### \`${entry.chart}\` / \`${entry.config}\`\n\n` +
+              chunks.push({
+                kind: 'text',
+                body:
+                  `### \`${entry.chart}\` / \`${entry.config}\`\n\n` +
                   `Could not produce a diff for this config.\n\n\`\`\`\n${message.trim()}\n\`\`\`\n\n`,
-              );
+              });
             }
 
             for (const item of changed) {
-              chunks.push(renderSummary(item.entry, item.parsed));
-              chunks.push(renderDiffBlock(item.entry, item.diff));
+              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.parsed) });
+              chunks.push({ kind: 'diff', entry: item.entry, diff: item.diff });
             }
 
             for (const body of packComments(header, chunks)) {
