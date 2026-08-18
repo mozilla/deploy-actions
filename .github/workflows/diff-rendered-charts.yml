@@ -64,6 +64,21 @@ jobs:
           mkdir -p shared/${MATRIX_REF_NAME}-charts
           if [ -f "${MATRIX_CHART}/Chart.yaml" ]; then
             helm dependency update "${MATRIX_CHART}"
+
+            # Render under the chart's own name rather than letting helm fall back to its
+            # `release-name` default. Charts using the stock `fullname` helper prefix resources
+            # with the release name, so the default produces names like
+            # `release-name-lando-web`, which match neither production nor a mozcloud chart
+            # naming resources from `app_code`. Because the diff matches resources on
+            # apiVersion/kind/metadata.name, a mismatched release name makes every resource
+            # look deleted and re-added. Mirrors `render-diff`, which defaults the release name
+            # to the chart name.
+            release_name=$(helm show chart "${MATRIX_CHART}" | sed -nE 's/^name:[[:space:]]*["'"'"']?([^"'"'"'[:space:]]+)["'"'"']?[[:space:]]*$/\1/p' | head -1)
+            if [ -z "$release_name" ]; then
+              release_name=$(basename "${MATRIX_CHART}")
+              echo "Could not read chart name from ${MATRIX_CHART}/Chart.yaml, falling back to ${release_name}"
+            fi
+
             values_files=$(find "$MATRIX_CHART" -maxdepth 1 -type f \( -name '*values*.yaml' -o -name '*values*.yml' \) ! \( -name 'values.yaml' -o -name 'values.yml' \))
 
             for values_path in ${values_files}; do
@@ -77,14 +92,14 @@ jobs:
 
               if [[ -n "$region" && -f "${MATRIX_CHART}/values-${env}.yaml" ]]; then
                 # Render with three layers: base, env, env-region
-                helm template "${MATRIX_CHART}" \
+                helm template "${release_name}" "${MATRIX_CHART}" \
                   -f "${MATRIX_CHART}/values.yaml" \
                   -f "${MATRIX_CHART}/values-${env}.yaml" \
                   -f "${MATRIX_CHART}/${values_file}" \
                   --output-dir "$render_path"
               else
                 # Only base + environment file
-                helm template "${MATRIX_CHART}" \
+                helm template "${release_name}" "${MATRIX_CHART}" \
                   -f "${MATRIX_CHART}/values.yaml" \
                   -f "${MATRIX_CHART}/${values_file}" \
                   --output-dir "$render_path"
