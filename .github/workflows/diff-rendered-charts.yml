@@ -304,6 +304,45 @@ jobs:
               };
             }
 
+            // A release-name mismatch between the two sides shows up as resources appearing in
+            // both Added and Removed with names differing only by a leading prefix, for example
+            // `release-name-lando-web` removed and `lando-web` added. The workflow renders under
+            // the chart directory name, which is Argo's default, but a chart whose tenant config
+            // sets `release_name` renders under something else in production. Those overrides
+            // live in another repository and are not visible here, so detect the symptom and say
+            // so rather than presenting a wholesale replacement as if it were real.
+            function detectPrefixMismatch(parsed) {
+              const groupOf = (id) => id.split('/').slice(0, -1).join('/'); // apiVersion/Kind
+              const nameOf = (id) => id.split('/').pop();
+
+              const addedByGroup = new Map();
+              for (const id of parsed.added) {
+                const group = groupOf(id);
+                if (!addedByGroup.has(group)) addedByGroup.set(group, []);
+                addedByGroup.get(group).push(nameOf(id));
+              }
+
+              const prefixes = new Map();
+              for (const id of parsed.removed) {
+                for (const addedName of addedByGroup.get(groupOf(id)) || []) {
+                  const removedName = nameOf(id);
+                  let prefix = null;
+                  if (removedName.endsWith(`-${addedName}`)) {
+                    prefix = removedName.slice(0, -(addedName.length + 1));
+                  } else if (addedName.endsWith(`-${removedName}`)) {
+                    prefix = addedName.slice(0, -(removedName.length + 1));
+                  }
+                  if (prefix) prefixes.set(prefix, (prefixes.get(prefix) || 0) + 1);
+                }
+              }
+
+              let best = null;
+              for (const [prefix, count] of prefixes) {
+                if (count >= 2 && (!best || count > best.count)) best = { prefix, count };
+              }
+              return best;
+            }
+
             // Cross-check the classification against the document counts recorded by the diff
             // step: the net change in document count must equal added minus removed. parseDyff
             // keys on dyff's own wording ("one document added"), so if that wording ever changes
@@ -335,12 +374,24 @@ jobs:
               return `**${label} (${ids.length})**\n${lines.join('\n')}\n\n`;
             }
 
-            function renderSummary(entry, parsed) {
+            function renderSummary(entry, parsed, mismatch) {
               let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
               body += `**${parsed.changeCount} ${parsed.changeCount === 1 ? 'change' : 'changes'}`;
               body += ` across ${parsed.resourceCount}`;
               body += ` ${parsed.resourceCount === 1 ? 'resource' : 'resources'}**`;
               body += ` (${entry.baseDocs} → ${entry.headDocs} documents)\n\n`;
+
+              if (mismatch) {
+                body += `> **This diff is probably misleading.** ${mismatch.count} resources appear as `;
+                body += `both added and removed, differing only by the name prefix `;
+                body += `\`${mismatch.prefix}-\`. That usually means the two sides were rendered `;
+                body += `under different Helm release names, so resources that actually correspond `;
+                body += `could not be matched up.\n>\n`;
+                body += `> Charts are rendered under their directory name, which is what Argo CD `;
+                body += `uses unless the tenant config sets \`release_name\`. If this chart has such `;
+                body += `an override, treat the added and removed lists as one set of resources, not two.\n\n`;
+              }
+
               body += renderResourceList('Updated', parsed.updated);
               body += renderResourceList('Added', parsed.added);
               body += renderResourceList('Removed', parsed.removed);
@@ -464,7 +515,18 @@ jobs:
               } else if (diff.trim().length > 0) {
                 const parsed = parseDyff(diff);
                 checkDocumentCounts(entry, parsed);
-                changed.push({ entry, diff, parsed });
+
+                const mismatch = detectPrefixMismatch(parsed);
+                if (mismatch) {
+                  core.warning(
+                    `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only by ` +
+                      `the name prefix "${mismatch.prefix}-" between the two sides, which suggests ` +
+                      `they were rendered under different Helm release names. The diff for this ` +
+                      `config is likely misleading.`,
+                  );
+                }
+
+                changed.push({ entry, diff, parsed, mismatch });
               } else {
                 unchanged.push(entry);
               }
@@ -505,7 +567,7 @@ jobs:
             }
 
             for (const item of changed) {
-              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.parsed) });
+              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.parsed, item.mismatch) });
               chunks.push({ kind: 'diff', entry: item.entry, diff: item.diff });
             }
 
