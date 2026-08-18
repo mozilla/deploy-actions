@@ -107,6 +107,20 @@ jobs:
                   -f "${MATRIX_CHART}/${values_file}" \
                   --output-dir "$render_path"
               fi
+
+              # Concatenate this config's rendered manifests into one multi-document YAML,
+              # written beside the render directory rather than inside it. Both the diff and the
+              # automerge evaluation consume this, so building it once here means they cannot
+              # drift apart and the work is not repeated. Ordering does not matter: both
+              # consumers match documents on apiVersion/kind/metadata.name.
+              manifest="shared/${MATRIX_REF_NAME}-charts/${MATRIX_CHART}/${output_name}.yaml"
+
+              : > "$manifest"
+
+              find "$render_path" -type f | sort | while read -r rendered; do
+                cat "$rendered" >> "$manifest"
+                echo "" >> "$manifest"  # ensure newline between files
+              done
            done
           fi
           echo sanitized_name=$(echo "${MATRIX_CHART}" | sed 's/\//-/g') >> $GITHUB_OUTPUT
@@ -153,31 +167,20 @@ jobs:
           : > diff/index.tsv
 
           for chart in ${CHARTS}; do
-            # When adding or removing a values file the `render_charts` job will only render one side of the chart to be compared
-            # Create the directory to be compared if it doesn't exist so `find` succeeds
             mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
 
-            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs --null -r basename -a | sort | uniq)
+            # The `render_charts` job already concatenated each config into a single
+            # multi-document YAML beside its render directory, so enumerate those.
+            # `-exec basename` rather than `xargs` so that a chart which rendered nothing
+            # yields an empty list instead of invoking basename with no operands.
+            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -exec basename {} .yaml \; | sort | uniq)
 
             for config in ${CONFIGS}; do
+              # When a values file is added or removed only one side renders it, so stand in an
+              # empty manifest for the missing side rather than skipping the config
               for side in base head; do
-                dir="shared/${side}-charts/${chart}/${config}"
-
-                # Create the directory to be compared if it doesn't exist so `find` succeeds
-                mkdir -p "${dir}"
-
-                # Concatenate every rendered manifest for this config into one multi-document YAML.
-                # dyff keys documents on apiVersion/kind/metadata.name, so the order files land in
-                # here has no bearing on how resources are matched between the two sides. This is
-                # what lets the diff survive templates moving to new paths.
-                MANIFEST="${dir}.yaml"
-
-                : > "$MANIFEST"
-
-                find "$dir" -type f | sort | while read -r file; do
-                  cat "$file" >> "$MANIFEST"
-                  echo "" >> "$MANIFEST"  # ensure newline between files
-                done
+                MANIFEST="shared/${side}-charts/${chart}/${config}.yaml"
+                [ -f "$MANIFEST" ] || : > "$MANIFEST"
               done
 
               OUTPUT_FILE="diff/${chart}/${config}.diff"
@@ -523,6 +526,19 @@ jobs:
                 return { chart, config, diffPath, baseDocs, headDocs };
               });
 
+            // A chart was detected as changed but nothing rendered for it, so there is nothing to
+            // compare. Do not fall through to the "no changes" message below: that would claim the
+            // rendered manifests are identical when in truth none were produced. Usually means the
+            // chart has no per-environment values files, or a changed path is not a chart root.
+            if (entries.length === 0) {
+              core.warning(
+                'No rendered manifests were found for the changed charts, so no diff could be ' +
+                  'produced. Check whether the changed paths are chart roots with per-environment ' +
+                  'values files.',
+              );
+              return;
+            }
+
             const changed = [];
             const failed = [];
             const unchanged = [];
@@ -665,31 +681,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          shopt -s nullglob
-
           for chart in ${CHARTS}; do
-            # When adding or removing a values file the `render_charts` job will only render one side of the chart to be compared
-            # Create the directory to be compared if it doesn't exist so `find` succeeds
             mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
 
-            CONFIGS=`find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs --null basename -a | sort | uniq`
+            # The `render_charts` job already concatenated each config into a single
+            # multi-document YAML beside its render directory, so enumerate those.
+            # `-exec basename` rather than `xargs` so that a chart which rendered nothing
+            # yields an empty list instead of invoking basename with no operands, which GNU
+            # xargs would do and which fails the step under `set -euo pipefail`.
+            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -exec basename {} .yaml \; | sort | uniq)
 
             mkdir -p diff/${chart}
 
             for config in ${CONFIGS}; do
-              for dir in "shared/base-charts/${chart}/${config}" "shared/head-charts/${chart}/${config}"; do
-                # Create the directory to be compared if it doesn't exist so `find` succeeds
-                mkdir -p "${dir}"
-
-                OUTPUT_FILE="${dir}.yaml"
-
-                touch "$OUTPUT_FILE"
-
-                # Recursively find and concatenate all files
-                find "$dir" -type f | sort | while read -r file; do
-                  cat "$file" >> "$OUTPUT_FILE"
-                  echo "" >> "$OUTPUT_FILE"  # ensure newline between files
-                done
+              # When a values file is added or removed only one side renders it, so stand in an
+              # empty manifest for the missing side rather than skipping the config
+              for side in base head; do
+                MANIFEST="shared/${side}-charts/${chart}/${config}.yaml"
+                [ -f "$MANIFEST" ] || : > "$MANIFEST"
               done
 
               diffnest --format json-patch "shared/base-charts/${chart}/${config}.yaml" "shared/head-charts/${chart}/${config}.yaml" > "diff/${chart}/${config}.json" || true

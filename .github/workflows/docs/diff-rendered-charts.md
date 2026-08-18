@@ -87,9 +87,24 @@ When a config renders identically on both sides it is called out as unchanged ra
 
 If the comment would exceed GitHub's 65536 character limit it is split across several comments, with the summary kept in the first.
 
+## How the manifests are assembled
+
+`render_charts` renders each chart once per values file, then concatenates that config's output into a single multi-document YAML beside the render directory:
+
+```
+shared/<ref>-charts/<chart>/<config>/     # helm template --output-dir tree
+shared/<ref>-charts/<chart>/<config>.yaml # the same manifests concatenated
+```
+
+Both the diff and the automerge evaluation read the `.yaml` file rather than walking the tree themselves. Building it once means the two cannot disagree about what was compared, and the work is not repeated.
+
+Charts are rendered under their **directory name** as the Helm release name, which is what Argo CD uses by default. This matters because the comparison matches resources by name: a release name that differs between the two sides makes every resource appear deleted and re-added. Charts whose tenant config overrides `release_name` are not handled, and the diff flags the symptom when it sees it (see MZCLD-3823).
+
+Concatenation order is irrelevant, since both consumers match documents on resource identity rather than position.
+
 ## Automerge evaluation
 
-With `automerge_test: true`, a separate job compares the same rendered manifests with [diffnest](https://github.com/sters/diffnest) to produce a JSON-patch representation of the change, then runs [conftest](https://www.conftest.dev/) against [`helm-automerge.rego`](https://github.com/mozilla/helm-charts/blob/main/policy/helm-automerge.rego) and reports the result as a `conftest test` commit status.
+With `automerge_test: true`, a separate job compares the same concatenated manifests with [diffnest](https://github.com/sters/diffnest) to produce a JSON-patch representation of the change, then runs [conftest](https://www.conftest.dev/) against [`helm-automerge.rego`](https://github.com/mozilla/helm-charts/blob/main/policy/helm-automerge.rego) and reports the result as a `conftest test` commit status.
 
 diffnest is used here rather than dyff because the policy consumes JSON-patch operations and dyff's CLI has no machine-readable output format. The policy only passes when the sole change is to the `mozcloud_chart_version` label, so anything else fails closed.
 
