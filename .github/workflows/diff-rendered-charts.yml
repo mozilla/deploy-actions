@@ -256,55 +256,61 @@ jobs:
             //   ! <description of the change>
             //   +/- <values>
             //
+            // dyff emits these in document order, so every block for a resource is already
+            // contiguous. Only the hierarchy is inverted for a reader: each block leads with the
+            // field path and names the resource underneath, so one Deployment reads as a dozen
+            // unrelated blocks. Group them so the resource is the heading instead, which is how
+            // Argo CD presents a diff.
+            //
             // A path of `(root level)` paired with a document added/removed description means the
             // resource as a whole appeared or disappeared; anything else is a field-level change.
             function parseDyff(text) {
-              const resources = new Map();
-              let changeCount = 0;
-              let currentPath = null;
-              let currentResource = null;
+              const blocks = [];
+              let current = null;
 
               for (const line of text.split('\n')) {
-                const pathMatch = line.match(/^@@ (.*) @@$/);
-                const resourceMatch = line.match(/^# (.+)$/);
-                const detailMatch = line.match(/^! (.+)$/);
+                const path = line.match(/^@@ (.*) @@$/);
+                const resource = line.match(/^# (.+)$/);
 
-                if (pathMatch) {
-                  currentPath = pathMatch[1];
-                  currentResource = null;
-                  changeCount += 1;
-                } else if (resourceMatch && currentPath !== null) {
-                  currentResource = resourceMatch[1];
-                  if (!resources.has(currentResource)) {
-                    resources.set(currentResource, { added: false, removed: false });
-                  }
-                } else if (detailMatch && currentResource !== null) {
-                  const isRootLevel = currentPath === '(root level)';
-                  if (isRootLevel && /one document added/.test(detailMatch[1])) {
-                    resources.get(currentResource).added = true;
-                  }
-                  if (isRootLevel && /one document removed/.test(detailMatch[1])) {
-                    resources.get(currentResource).removed = true;
-                  }
+                if (path) {
+                  current = { path: path[1], id: null, lines: [] };
+                  blocks.push(current);
+                } else if (!current) {
+                  continue;
+                } else if (resource && current.id === null) {
+                  current.id = resource[1];
+                } else if (line.length > 0) {
+                  current.lines.push(line);
                 }
               }
 
-              const added = [];
-              const removed = [];
-              const updated = [];
-              for (const [id, flags] of resources) {
-                if (flags.added) added.push(id);
-                else if (flags.removed) removed.push(id);
-                else updated.push(id);
+              const resources = [];
+              for (const block of blocks) {
+                const last = resources[resources.length - 1];
+                if (last && last.id === block.id) {
+                  last.blocks.push(block);
+                } else {
+                  resources.push({ id: block.id, blocks: [block] });
+                }
               }
 
-              return {
-                changeCount,
-                resourceCount: resources.size,
-                added: added.sort(),
-                removed: removed.sort(),
-                updated: updated.sort(),
-              };
+              for (const resource of resources) {
+                const details = resource.blocks.flatMap((b) => b.lines.filter((l) => l.startsWith('!')));
+                const isRoot = (b) => b.path === '(root level)';
+
+                resource.changeCount = resource.blocks.length;
+                resource.isAddition =
+                  resource.blocks.some(isRoot) && details.some((d) => /one document added/.test(d));
+                resource.isRemoval =
+                  resource.blocks.some(isRoot) && details.some((d) => /one document removed/.test(d));
+
+                // Re-emit each block with its path, minus the now redundant `# resource` line
+                resource.diff = resource.blocks
+                  .map((b) => [`@@ ${b.path} @@`, ...b.lines].join('\n'))
+                  .join('\n');
+              }
+
+              return resources;
             }
 
             // A release-name mismatch between the two sides shows up as resources appearing in
@@ -314,15 +320,15 @@ jobs:
             // sets `release_name` renders under something else in production. Those overrides
             // live in another repository and are not visible here, so detect the symptom and say
             // so rather than presenting a wholesale replacement as if it were real.
-            function detectPrefixMismatch(parsed) {
+            function detectPrefixMismatch(resources) {
               const groupOf = (id) => id.split('/').slice(0, -1).join('/'); // apiVersion/Kind
               const nameOf = (id) => id.split('/').pop();
 
               const addedByGroup = new Map();
-              for (const id of parsed.added) {
-                const group = groupOf(id);
+              for (const r of resources.filter((r) => r.isAddition)) {
+                const group = groupOf(r.id);
                 if (!addedByGroup.has(group)) addedByGroup.set(group, []);
-                addedByGroup.get(group).push(nameOf(id));
+                addedByGroup.get(group).push(nameOf(r.id));
               }
 
               // Length of the shared trailing run of `-` separated segments. Comparing segments
@@ -338,9 +344,9 @@ jobs:
               };
 
               const deltas = new Map();
-              for (const id of parsed.removed) {
-                const removed = nameOf(id).split('-');
-                for (const addedName of addedByGroup.get(groupOf(id)) || []) {
+              for (const r of resources.filter((r) => r.isRemoval)) {
+                const removed = nameOf(r.id).split('-');
+                for (const addedName of addedByGroup.get(groupOf(r.id)) || []) {
                   const added = addedName.split('-');
                   const shared = sharedTail(removed, added);
 
@@ -371,37 +377,32 @@ jobs:
             // keys on dyff's own wording ("one document added"), so if that wording ever changes
             // every resource would quietly fall into Updated and the summary would mislead while
             // still looking plausible. This turns that silent drift into a warning.
-            function checkDocumentCounts(entry, parsed) {
+            function checkDocumentCounts(entry, resources) {
               const recorded = Number(entry.headDocs) - Number(entry.baseDocs);
-              const classified = parsed.added.length - parsed.removed.length;
+              const classified =
+                resources.filter((r) => r.isAddition).length -
+                resources.filter((r) => r.isRemoval).length;
 
               if (Number.isFinite(recorded) && recorded !== classified) {
                 core.warning(
                   `${entry.chart} / ${entry.config}: rendered document count changed by ` +
-                    `${recorded}, but ${parsed.added.length} added and ${parsed.removed.length} ` +
-                    `removed account for ${classified}. The added/removed/updated summary may be ` +
+                    `${recorded}, but the diff accounts for ${classified}. The summary may be ` +
                     `inaccurate; the diff itself is unaffected.`,
                 );
               }
             }
 
-            function renderResourceList(label, ids) {
-              if (ids.length === 0) return '';
+            // The per-config heading. The resources themselves follow as collapsible sections
+            // grouped under Updated / Added / Removed, rather than being listed by name here and
+            // then again below: naming each resource twice made the comment longer and forced the
+            // name list to be truncated on large diffs.
+            function renderSummary(entry, resources, mismatch) {
+              const changes = resources.reduce((n, r) => n + r.changeCount, 0);
 
-              const shown = ids.slice(0, MAX_LISTED_RESOURCES);
-              const lines = shown.map((id) => `- \`${id}\``);
-              if (ids.length > shown.length) {
-                lines.push(`- ...and ${ids.length - shown.length} more`);
-              }
-
-              return `**${label} (${ids.length})**\n${lines.join('\n')}\n\n`;
-            }
-
-            function renderSummary(entry, parsed, mismatch) {
               let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
-              body += `**${parsed.changeCount} ${parsed.changeCount === 1 ? 'change' : 'changes'}`;
-              body += ` across ${parsed.resourceCount}`;
-              body += ` ${parsed.resourceCount === 1 ? 'resource' : 'resources'}**`;
+              body += `**${changes} ${changes === 1 ? 'change' : 'changes'}`;
+              body += ` across ${resources.length}`;
+              body += ` ${resources.length === 1 ? 'resource' : 'resources'}**`;
               body += ` (${entry.baseDocs} → ${entry.headDocs} documents)\n\n`;
 
               if (mismatch) {
@@ -414,23 +415,30 @@ jobs:
                 body += `unless the tenant config sets \`release_name\`. Migrated charts often name `;
                 body += `resources with the release name baked in, to avoid recreating them, so a chart `;
                 body += `with such an override will diff against a prefix it never uses in production. `;
-                body += `Treat the added and removed lists as one set of resources, not two.\n\n`;
+                body += `Treat the added and removed sections as one set of resources, not two.\n\n`;
               }
 
-              body += renderResourceList('Updated', parsed.updated);
-              body += renderResourceList('Added', parsed.added);
-              body += renderResourceList('Removed', parsed.removed);
               return body;
             }
 
-            // Render one slice of a diff, wrapped so that every comment is independently valid:
-            // its own <details> opened and closed, and its own fence opened and closed. An
-            // earlier version reopened only the fence in continuations, which left one comment
-            // with an unclosed <details> and the next with an orphan </details> rendered fully
-            // expanded.
-            function renderDiffPart(entry, body, isContinuation, isFinal) {
+            function renderCategoryHeading(label, count) {
+              return `**${label} (${count})**\n\n`;
+            }
+
+            // Render one slice of a resource's diff. Each resource is its own collapsible section
+            // so a reviewer expands only what they care about, and every section is independently
+            // valid: its own <details> opened and closed, its own fence opened and closed. That
+            // matters because a comment can end mid-resource.
+            function renderDiffPart(resource, body, isContinuation, isFinal) {
               const suffix = isContinuation ? ' (continued)' : '';
-              let out = `<details><summary>Show full diff for <code>${entry.chart}</code> / <code>${entry.config}</code>${suffix}</summary>\n\n`;
+              const n = resource.changeCount;
+              const detail = resource.isAddition
+                ? 'added'
+                : resource.isRemoval
+                  ? 'removed'
+                  : `${n} ${n === 1 ? 'change' : 'changes'}`;
+
+              let out = `<details><summary><code>${resource.id}</code> — ${detail}${suffix}</summary>\n\n`;
               out += '```diff\n' + body.replace(/\n+$/, '') + '\n```\n</details>\n\n';
               if (!isFinal) {
                 out += '**Note**: output exceeds the maximum comment size, continued in the next comment.\n\n';
@@ -470,8 +478,8 @@ jobs:
 
                 // Overhead is measured with the continuation suffix and the note present, so it
                 // is the worst case and can never under-reserve.
-                const overhead = renderDiffPart(chunk.entry, '', true, false).length;
-                const lines = chunk.diff.replace(/\n+$/, '').split('\n');
+                const overhead = renderDiffPart(chunk.resource, '', true, false).length;
+                const lines = chunk.resource.diff.replace(/\n+$/, '').split('\n');
 
                 let index = 0;
                 let isContinuation = false;
@@ -501,7 +509,7 @@ jobs:
                   }
 
                   const isFinal = index >= lines.length;
-                  append(renderDiffPart(chunk.entry, taken.join('\n'), isContinuation, isFinal));
+                  append(renderDiffPart(chunk.resource, taken.join('\n'), isContinuation, isFinal));
                   isContinuation = true;
 
                   if (!isFinal) flush();
@@ -551,10 +559,10 @@ jobs:
               if (diff.startsWith('DYFF_ERROR')) {
                 failed.push({ entry, message: diff.replace(/^DYFF_ERROR\n?/, '') });
               } else if (diff.trim().length > 0) {
-                const parsed = parseDyff(diff);
-                checkDocumentCounts(entry, parsed);
+                const resources = parseDyff(diff);
+                checkDocumentCounts(entry, resources);
 
-                const mismatch = detectPrefixMismatch(parsed);
+                const mismatch = detectPrefixMismatch(resources);
                 if (mismatch) {
                   core.warning(
                     `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only in ` +
@@ -564,7 +572,7 @@ jobs:
                   );
                 }
 
-                changed.push({ entry, diff, parsed, mismatch });
+                changed.push({ entry, resources, mismatch });
               } else {
                 unchanged.push(entry);
               }
@@ -605,8 +613,21 @@ jobs:
             }
 
             for (const item of changed) {
-              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.parsed, item.mismatch) });
-              chunks.push({ kind: 'diff', entry: item.entry, diff: item.diff });
+              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.resources, item.mismatch) });
+
+              const categories = [
+                ['Updated', item.resources.filter((r) => !r.isAddition && !r.isRemoval)],
+                ['Added', item.resources.filter((r) => r.isAddition)],
+                ['Removed', item.resources.filter((r) => r.isRemoval)],
+              ];
+
+              for (const [label, resources] of categories) {
+                if (resources.length === 0) continue;
+                chunks.push({ kind: 'text', body: renderCategoryHeading(label, resources.length) });
+                for (const resource of resources) {
+                  chunks.push({ kind: 'diff', resource });
+                }
+              }
             }
 
             for (const body of packComments(header, chunks)) {
