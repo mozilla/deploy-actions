@@ -303,10 +303,12 @@ jobs:
                 resource.isRemoval =
                   resource.blocks.some(isRoot) && details.some((d) => /one document removed/.test(d));
 
-                // Re-emit each block with its path, minus the now redundant `# resource` line
+                // Re-emit each block with its path, minus the now redundant `# resource` line.
+                // Blocks are separated by a blank line so that consecutive changed fields do not
+                // run together into one wall of text.
                 resource.diff = resource.blocks
                   .map((b) => [`@@ ${b.path} @@`, ...b.lines].join('\n'))
-                  .join('\n');
+                  .join('\n\n');
               }
 
               return resources;
