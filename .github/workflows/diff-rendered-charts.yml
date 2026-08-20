@@ -109,10 +109,10 @@ jobs:
               fi
 
               # Concatenate this config's rendered manifests into one multi-document YAML,
-              # written beside the render directory rather than inside it. Both the diff and the
-              # automerge evaluation consume this, so building it once here means they cannot
-              # drift apart and the work is not repeated. Ordering does not matter: both
-              # consumers match documents on apiVersion/kind/metadata.name.
+              # written beside the render directory rather than inside it. The automerge
+              # evaluation consumes this, so building it once here means the work is not
+              # repeated. Ordering does not matter: diffnest matches documents on
+              # apiVersion/kind/metadata.name.
               manifest="shared/${MATRIX_REF_NAME}-charts/${MATRIX_CHART}/${output_name}.yaml"
 
               : > "$manifest"
@@ -121,6 +121,26 @@ jobs:
                 cat "$rendered" >> "$manifest"
                 echo "" >> "$manifest"  # ensure newline between files
               done
+
+              # Also split the manifests into one file per resource, named for its identity.
+              # This is what makes the diff immune to templates moving: the filename is the
+              # resource, not the template that produced it, so an ordinary recursive diff
+              # compares like with like.
+              #
+              #   apps~v1~Deployment~lando-web.yml  ->  apps/v1/Deployment/lando-web
+              #
+              # `~` is a safe separator: it cannot appear in an apiVersion or in a DNS-1123
+              # resource name, so the identity can be recovered from the filename.
+              #
+              # `# Source:` comments are dropped because they name the template that produced
+              # the resource, which is precisely the thing that changes during a migration.
+              # `sort_keys` makes key ordering irrelevant, so a reordered map is not a change.
+              by_resource="shared/${MATRIX_REF_NAME}-charts/${MATRIX_CHART}/${output_name}.by-resource"
+              mkdir -p "$by_resource"
+
+              grep -hv '^# Source:' "$manifest" \
+                | yq 'select(.kind != null) | sort_keys(..)' \
+                | (cd "$by_resource" && yq -s '(.apiVersion | sub("/"; "~")) + "~" + .kind + "~" + .metadata.name')
            done
           fi
           echo sanitized_name=$(echo "${MATRIX_CHART}" | sed 's/\//-/g') >> $GITHUB_OUTPUT
@@ -147,16 +167,6 @@ jobs:
           merge-multiple: true
           path: "shared"
 
-      # TODO Move this step into a separate action with tool cache support
-      - name: install dyff
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          gh release download v1.12.0 -R homeport/dyff -p "dyff_*_linux_amd64.tar.gz" -O - | tar xzf - dyff
-          mv dyff /usr/local/bin
-
       - name: diff helm charts
         env:
           CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
@@ -177,35 +187,28 @@ jobs:
 
             for config in ${CONFIGS}; do
               # When a values file is added or removed only one side renders it, so stand in an
-              # empty manifest for the missing side rather than skipping the config
+              # empty directory for the missing side rather than skipping the config
               for side in base head; do
-                MANIFEST="shared/${side}-charts/${chart}/${config}.yaml"
-                [ -f "$MANIFEST" ] || : > "$MANIFEST"
+                mkdir -p "shared/${side}-charts/${chart}/${config}.by-resource"
               done
 
               OUTPUT_FILE="diff/${chart}/${config}.diff"
               mkdir -p "$(dirname "$OUTPUT_FILE")"
 
-              # `--detect-kubernetes` and `--detect-renames` are dyff defaults; passed explicitly
-              # because they are the whole point of using dyff here
-              if ! dyff between \
-                --output github \
-                --omit-header \
-                --ignore-order-changes \
-                --ignore-whitespace-changes \
-                --detect-kubernetes \
-                --detect-renames \
-                "shared/base-charts/${chart}/${config}.yaml" \
-                "shared/head-charts/${chart}/${config}.yaml" > "$OUTPUT_FILE" 2> "${OUTPUT_FILE}.err"; then
-                # Surface the failure in the comment rather than failing the whole job, so one
-                # unparseable config cannot suppress the diff for every other chart
-                { echo "DYFF_ERROR"; cat "${OUTPUT_FILE}.err"; } > "$OUTPUT_FILE"
-              fi
+              # An ordinary recursive unified diff. Because the render job named each file for
+              # the resource it contains, this compares like with like even when the template
+              # that produced a resource has moved. `-N` treats a file present on only one side
+              # as an addition or removal rather than skipping it.
+              # No --label: the file paths in the `diff` header lines are what identify each
+              # resource, and the comment step turns them back into apiVersion/kind/name
+              diff -ruN \
+                "shared/base-charts/${chart}/${config}.by-resource" \
+                "shared/head-charts/${chart}/${config}.by-resource" > "$OUTPUT_FILE" || true
 
-              BASE_DOCS=$(grep -c '^kind:' "shared/base-charts/${chart}/${config}.yaml" || true)
-              HEAD_DOCS=$(grep -c '^kind:' "shared/head-charts/${chart}/${config}.yaml" || true)
+              BASE_COUNT=$(find "shared/base-charts/${chart}/${config}.by-resource" -type f | wc -l | tr -d ' ')
+              HEAD_COUNT=$(find "shared/head-charts/${chart}/${config}.by-resource" -type f | wc -l | tr -d ' ')
 
-              printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$config" "$OUTPUT_FILE" "$BASE_DOCS" "$HEAD_DOCS" >> diff/index.tsv
+              printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$config" "$OUTPUT_FILE" "$BASE_COUNT" "$HEAD_COUNT" >> diff/index.tsv
             done
           done
 
@@ -249,84 +252,79 @@ jobs:
               }
             }
 
-            // dyff's github output is a sequence of blocks:
+            // `diff -ruN` emits one section per file, headed by a line naming both paths.
+            // The render job named each file for the resource it contains, so the filename is
+            // the identity and the sections are already per-resource:
             //
-            //   @@ <path> @@
-            //   # <apiVersion>/<Kind>/<name>
-            //   ! <description of the change>
-            //   +/- <values>
+            //   diff -ruN base/.../apps~v1~Deployment~lando-web.yml head/.../apps~v1~Deployment~lando-web.yml
+            //   --- base/...
+            //   +++ head/...
+            //   @@ -12,6 +12,9 @@
             //
-            // A path of `(root level)` paired with a document added/removed description means the
-            // resource as a whole appeared or disappeared; anything else is a field-level change.
-            function parseDyff(text) {
-              const resources = new Map();
-              let changeCount = 0;
-              let currentPath = null;
-              let currentResource = null;
+            // A file present on only one side is an addition or removal, which `-N` renders as a
+            // diff against an empty file. Those are recognised by every body line sharing one
+            // sign, which is more robust than reading the epoch timestamp `-N` puts in the
+            // header, since that is locale and timezone dependent.
+            function parseDiff(text) {
+              const resources = [];
+              let current = null;
 
               for (const line of text.split('\n')) {
-                const pathMatch = line.match(/^@@ (.*) @@$/);
-                const resourceMatch = line.match(/^# (.+)$/);
-                const detailMatch = line.match(/^! (.+)$/);
+                const header = line.match(/^diff .*?([^/\s]+)\.yml$/);
 
-                if (pathMatch) {
-                  currentPath = pathMatch[1];
-                  currentResource = null;
-                  changeCount += 1;
-                } else if (resourceMatch && currentPath !== null) {
-                  currentResource = resourceMatch[1];
-                  if (!resources.has(currentResource)) {
-                    resources.set(currentResource, { added: false, removed: false });
-                  }
-                } else if (detailMatch && currentResource !== null) {
-                  const isRootLevel = currentPath === '(root level)';
-                  if (isRootLevel && /one document added/.test(detailMatch[1])) {
-                    resources.get(currentResource).added = true;
-                  }
-                  if (isRootLevel && /one document removed/.test(detailMatch[1])) {
-                    resources.get(currentResource).removed = true;
-                  }
+                if (header) {
+                  current = { id: header[1].replace(/~/g, '/'), lines: [] };
+                  resources.push(current);
+                  continue;
                 }
+                if (!current) continue;
+                // The ---/+++ lines only repeat the paths already captured in the heading
+                if (/^(---|\+\+\+) /.test(line)) continue;
+                current.lines.push(line);
               }
 
-              const added = [];
-              const removed = [];
-              const updated = [];
-              for (const [id, flags] of resources) {
-                if (flags.added) added.push(id);
-                else if (flags.removed) removed.push(id);
-                else updated.push(id);
+              for (const resource of resources) {
+                const body = resource.lines.filter((l) => l.length > 0);
+                const hunks = body.filter((l) => l.startsWith('@@'));
+
+                resource.changedLines = body.filter(
+                  (l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('@@'),
+                ).length;
+
+                // Read the hunk header rather than the signs on the body lines. A resource that
+                // only gained fields has nothing but `+` lines yet still exists on both sides, so
+                // counting signs would report it as newly added. `-0,0` means the base side of
+                // the hunk is empty, and `+0,0` means the head side is; that is exact, and unlike
+                // the epoch timestamp `-N` writes into the header it does not depend on locale.
+                resource.isAddition = hunks.length > 0 && hunks.every((h) => /^@@ -0,0 /.test(h));
+                resource.isRemoval = hunks.length > 0 && hunks.every((h) => /\+0,0 @@/.test(h));
+
+                resource.diff = resource.lines.join('\n').replace(/^\n+|\n+$/g, '');
               }
 
-              return {
-                changeCount,
-                resourceCount: resources.size,
-                added: added.sort(),
-                removed: removed.sort(),
-                updated: updated.sort(),
-              };
+              return resources.filter((r) => r.changedLines > 0);
             }
 
-            // A release-name mismatch between the two sides shows up as resources appearing in
-            // both Added and Removed with names differing only by a leading prefix, for example
-            // `release-name-lando-web` removed and `lando-web` added. The workflow renders under
-            // the chart directory name, which is Argo's default, but a chart whose tenant config
-            // sets `release_name` renders under something else in production. Those overrides
-            // live in another repository and are not visible here, so detect the symptom and say
-            // so rather than presenting a wholesale replacement as if it were real.
-            function detectPrefixMismatch(parsed) {
+            // A release-name mismatch between the two sides shows up as resources appearing as
+            // both an addition and a removal with names differing only by a leading prefix. The
+            // workflow renders under the chart directory name, which is Argo's default, but a
+            // chart whose tenant config sets `release_name` renders under something else in
+            // production. Those overrides live in another repository and are not visible here,
+            // so detect the symptom and say so rather than presenting a wholesale replacement as
+            // if it were real.
+            function detectPrefixMismatch(resources) {
               const groupOf = (id) => id.split('/').slice(0, -1).join('/'); // apiVersion/Kind
               const nameOf = (id) => id.split('/').pop();
 
               const addedByGroup = new Map();
-              for (const id of parsed.added) {
-                const group = groupOf(id);
+              for (const r of resources.filter((r) => r.isAddition)) {
+                const group = groupOf(r.id);
                 if (!addedByGroup.has(group)) addedByGroup.set(group, []);
-                addedByGroup.get(group).push(nameOf(id));
+                addedByGroup.get(group).push(nameOf(r.id));
               }
 
               // Length of the shared trailing run of `-` separated segments. Comparing segments
-              // rather than raw strings is what catches a prefix being *replaced* rather than
+              // rather than raw strings is what catches a prefix being replaced rather than
               // merely added: `treeherder-web` versus `treeherder-v2-web` share the tail `web`
               // but neither name is a suffix of the other.
               const sharedTail = (a, b) => {
@@ -338,13 +336,12 @@ jobs:
               };
 
               const deltas = new Map();
-              for (const id of parsed.removed) {
-                const removed = nameOf(id).split('-');
-                for (const addedName of addedByGroup.get(groupOf(id)) || []) {
+              for (const r of resources.filter((r) => r.isRemoval)) {
+                const removed = nameOf(r.id).split('-');
+                for (const addedName of addedByGroup.get(groupOf(r.id)) || []) {
                   const added = addedName.split('-');
                   const shared = sharedTail(removed, added);
 
-                  // Need a shared tail, and the names must not be identical
                   if (shared === 0) continue;
                   if (shared === removed.length && shared === added.length) continue;
 
@@ -366,20 +363,18 @@ jobs:
               return best;
             }
 
-            // Cross-check the classification against the document counts recorded by the diff
-            // step: the net change in document count must equal added minus removed. parseDyff
-            // keys on dyff's own wording ("one document added"), so if that wording ever changes
-            // every resource would quietly fall into Updated and the summary would mislead while
-            // still looking plausible. This turns that silent drift into a warning.
-            function checkDocumentCounts(entry, parsed) {
-              const recorded = Number(entry.headDocs) - Number(entry.baseDocs);
-              const classified = parsed.added.length - parsed.removed.length;
+            // Cross-check the classification against the resource counts recorded by the diff
+            // step: the net change in resource count must equal additions minus removals.
+            function checkResourceCounts(entry, resources) {
+              const recorded = Number(entry.headCount) - Number(entry.baseCount);
+              const classified =
+                resources.filter((r) => r.isAddition).length -
+                resources.filter((r) => r.isRemoval).length;
 
               if (Number.isFinite(recorded) && recorded !== classified) {
                 core.warning(
-                  `${entry.chart} / ${entry.config}: rendered document count changed by ` +
-                    `${recorded}, but ${parsed.added.length} added and ${parsed.removed.length} ` +
-                    `removed account for ${classified}. The added/removed/updated summary may be ` +
+                  `${entry.chart} / ${entry.config}: rendered resource count changed by ` +
+                    `${recorded}, but the diff accounts for ${classified}. The summary may be ` +
                     `inaccurate; the diff itself is unaffected.`,
                 );
               }
@@ -397,12 +392,17 @@ jobs:
               return `**${label} (${ids.length})**\n${lines.join('\n')}\n\n`;
             }
 
-            function renderSummary(entry, parsed, mismatch) {
+            function renderSummary(entry, resources, mismatch) {
+              const updated = resources.filter((r) => !r.isAddition && !r.isRemoval).map((r) => r.id);
+              const added = resources.filter((r) => r.isAddition).map((r) => r.id);
+              const removed = resources.filter((r) => r.isRemoval).map((r) => r.id);
+              const lines = resources.reduce((n, r) => n + r.changedLines, 0);
+
               let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
-              body += `**${parsed.changeCount} ${parsed.changeCount === 1 ? 'change' : 'changes'}`;
-              body += ` across ${parsed.resourceCount}`;
-              body += ` ${parsed.resourceCount === 1 ? 'resource' : 'resources'}**`;
-              body += ` (${entry.baseDocs} → ${entry.headDocs} documents)\n\n`;
+              body += `**${lines} changed ${lines === 1 ? 'line' : 'lines'}`;
+              body += ` across ${resources.length}`;
+              body += ` ${resources.length === 1 ? 'resource' : 'resources'}**`;
+              body += ` (${entry.baseCount} → ${entry.headCount} resources)\n\n`;
 
               if (mismatch) {
                 body += `> **This diff is probably misleading.** ${mismatch.count} resources appear as `;
@@ -417,20 +417,21 @@ jobs:
                 body += `Treat the added and removed lists as one set of resources, not two.\n\n`;
               }
 
-              body += renderResourceList('Updated', parsed.updated);
-              body += renderResourceList('Added', parsed.added);
-              body += renderResourceList('Removed', parsed.removed);
+              body += renderResourceList('Updated', updated);
+              body += renderResourceList('Added', added);
+              body += renderResourceList('Removed', removed);
               return body;
             }
 
-            // Render one slice of a diff, wrapped so that every comment is independently valid:
-            // its own <details> opened and closed, and its own fence opened and closed. An
-            // earlier version reopened only the fence in continuations, which left one comment
-            // with an unclosed <details> and the next with an orphan </details> rendered fully
-            // expanded.
-            function renderDiffPart(entry, body, isContinuation, isFinal) {
+            // Render one slice of a resource's diff. Each resource gets its own collapsible
+            // section, so a reviewer expands only what they care about, and every section is
+            // independently valid: its own <details> opened and closed, its own fence opened and
+            // closed. That matters because a comment can end mid-resource.
+            function renderDiffPart(resource, body, isContinuation, isFinal) {
               const suffix = isContinuation ? ' (continued)' : '';
-              let out = `<details><summary>Show full diff for <code>${entry.chart}</code> / <code>${entry.config}</code>${suffix}</summary>\n\n`;
+              const verb = resource.isAddition ? 'added' : resource.isRemoval ? 'removed' : `${resource.changedLines} changed lines`;
+
+              let out = `<details><summary><code>${resource.id}</code> — ${verb}${suffix}</summary>\n\n`;
               out += '```diff\n' + body.replace(/\n+$/, '') + '\n```\n</details>\n\n';
               if (!isFinal) {
                 out += '**Note**: output exceeds the maximum comment size, continued in the next comment.\n\n';
@@ -470,8 +471,8 @@ jobs:
 
                 // Overhead is measured with the continuation suffix and the note present, so it
                 // is the worst case and can never under-reserve.
-                const overhead = renderDiffPart(chunk.entry, '', true, false).length;
-                const lines = chunk.diff.replace(/\n+$/, '').split('\n');
+                const overhead = renderDiffPart(chunk.resource, '', true, false).length;
+                const lines = chunk.resource.diff.replace(/\n+$/, '').split('\n');
 
                 let index = 0;
                 let isContinuation = false;
@@ -501,7 +502,7 @@ jobs:
                   }
 
                   const isFinal = index >= lines.length;
-                  append(renderDiffPart(chunk.entry, taken.join('\n'), isContinuation, isFinal));
+                  append(renderDiffPart(chunk.resource, taken.join('\n'), isContinuation, isFinal));
                   isContinuation = true;
 
                   if (!isFinal) flush();
@@ -522,8 +523,8 @@ jobs:
               .split('\n')
               .filter((line) => line.trim().length > 0)
               .map((line) => {
-                const [chart, config, diffPath, baseDocs, headDocs] = line.split('\t');
-                return { chart, config, diffPath, baseDocs, headDocs };
+                const [chart, config, diffPath, baseCount, headCount] = line.split('\t');
+                return { chart, config, diffPath, baseCount, headCount };
               });
 
             // A chart was detected as changed but nothing rendered for it, so there is nothing to
@@ -548,13 +549,12 @@ jobs:
                 ? fs.readFileSync(entry.diffPath, 'utf8')
                 : '';
 
-              if (diff.startsWith('DYFF_ERROR')) {
-                failed.push({ entry, message: diff.replace(/^DYFF_ERROR\n?/, '') });
-              } else if (diff.trim().length > 0) {
-                const parsed = parseDyff(diff);
-                checkDocumentCounts(entry, parsed);
+              const resources = diff.trim().length > 0 ? parseDiff(diff) : [];
 
-                const mismatch = detectPrefixMismatch(parsed);
+              if (resources.length > 0) {
+                checkResourceCounts(entry, resources);
+
+                const mismatch = detectPrefixMismatch(resources);
                 if (mismatch) {
                   core.warning(
                     `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only in ` +
@@ -564,7 +564,7 @@ jobs:
                   );
                 }
 
-                changed.push({ entry, diff, parsed, mismatch });
+                changed.push({ entry, resources, mismatch });
               } else {
                 unchanged.push(entry);
               }
@@ -605,8 +605,10 @@ jobs:
             }
 
             for (const item of changed) {
-              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.parsed, item.mismatch) });
-              chunks.push({ kind: 'diff', entry: item.entry, diff: item.diff });
+              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.resources, item.mismatch) });
+              for (const resource of item.resources) {
+                chunks.push({ kind: 'diff', resource });
+              }
             }
 
             for (const body of packComments(header, chunks)) {
