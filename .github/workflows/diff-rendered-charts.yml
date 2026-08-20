@@ -217,7 +217,6 @@ jobs:
             const fs = require('fs');
 
             const COMMENT_CHAR_LIMIT = 65536; // GitHub comment character limit
-            const MAX_LISTED_RESOURCES = 25;  // per category, before collapsing to a count
             // Identifies our own comments so superseded ones can be folded away on the next push
             const MARKER = '<!-- mozilla/deploy-actions:diff-rendered-charts -->';
             const INDEX_FILE = 'diff/index.tsv';
