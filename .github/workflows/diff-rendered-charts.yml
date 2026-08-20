@@ -616,10 +616,14 @@ jobs:
             for (const item of changed) {
               chunks.push({ kind: 'text', body: renderSummary(item.entry, item.resources, item.mismatch) });
 
+              // Sort by identity rather than leaving the upstream order in place. dyff emits in
+              // document order and `diff -ruN` in filename order, neither of which is stable or
+              // predictable for a reader looking for a particular resource.
+              const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
               const categories = [
-                ['Updated', item.resources.filter((r) => !r.isAddition && !r.isRemoval)],
-                ['Added', item.resources.filter((r) => r.isAddition)],
-                ['Removed', item.resources.filter((r) => r.isRemoval)],
+                ['Updated', item.resources.filter((r) => !r.isAddition && !r.isRemoval).sort(byId)],
+                ['Added', item.resources.filter((r) => r.isAddition).sort(byId)],
+                ['Removed', item.resources.filter((r) => r.isRemoval).sort(byId)],
               ];
 
               for (const [label, resources] of categories) {
