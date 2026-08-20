@@ -220,7 +220,6 @@ jobs:
             const fs = require('fs');
 
             const COMMENT_CHAR_LIMIT = 65536; // GitHub comment character limit
-            const MAX_LISTED_RESOURCES = 25;  // per category, before collapsing to a count
             // Identifies our own comments so superseded ones can be folded away on the next push
             const MARKER = '<!-- mozilla/deploy-actions:diff-rendered-charts -->';
             const INDEX_FILE = 'diff/index.tsv';
@@ -380,22 +379,11 @@ jobs:
               }
             }
 
-            function renderResourceList(label, ids) {
-              if (ids.length === 0) return '';
-
-              const shown = ids.slice(0, MAX_LISTED_RESOURCES);
-              const lines = shown.map((id) => `- \`${id}\``);
-              if (ids.length > shown.length) {
-                lines.push(`- ...and ${ids.length - shown.length} more`);
-              }
-
-              return `**${label} (${ids.length})**\n${lines.join('\n')}\n\n`;
-            }
-
+            // The per-config heading. The resources themselves follow as collapsible sections
+            // grouped under Updated / Added / Removed, rather than being listed by name here and
+            // then again below: naming each resource twice made the comment longer and forced the
+            // name list to be truncated on large diffs.
             function renderSummary(entry, resources, mismatch) {
-              const updated = resources.filter((r) => !r.isAddition && !r.isRemoval).map((r) => r.id);
-              const added = resources.filter((r) => r.isAddition).map((r) => r.id);
-              const removed = resources.filter((r) => r.isRemoval).map((r) => r.id);
               const lines = resources.reduce((n, r) => n + r.changedLines, 0);
 
               let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
@@ -414,13 +402,14 @@ jobs:
                 body += `unless the tenant config sets \`release_name\`. Migrated charts often name `;
                 body += `resources with the release name baked in, to avoid recreating them, so a chart `;
                 body += `with such an override will diff against a prefix it never uses in production. `;
-                body += `Treat the added and removed lists as one set of resources, not two.\n\n`;
+                body += `Treat the added and removed sections as one set of resources, not two.\n\n`;
               }
 
-              body += renderResourceList('Updated', updated);
-              body += renderResourceList('Added', added);
-              body += renderResourceList('Removed', removed);
               return body;
+            }
+
+            function renderCategoryHeading(label, count) {
+              return `**${label} (${count})**\n\n`;
             }
 
             // Render one slice of a resource's diff. Each resource gets its own collapsible
@@ -606,8 +595,19 @@ jobs:
 
             for (const item of changed) {
               chunks.push({ kind: 'text', body: renderSummary(item.entry, item.resources, item.mismatch) });
-              for (const resource of item.resources) {
-                chunks.push({ kind: 'diff', resource });
+
+              const categories = [
+                ['Updated', item.resources.filter((r) => !r.isAddition && !r.isRemoval)],
+                ['Added', item.resources.filter((r) => r.isAddition)],
+                ['Removed', item.resources.filter((r) => r.isRemoval)],
+              ];
+
+              for (const [label, resources] of categories) {
+                if (resources.length === 0) continue;
+                chunks.push({ kind: 'text', body: renderCategoryHeading(label, resources.length) });
+                for (const resource of resources) {
+                  chunks.push({ kind: 'diff', resource });
+                }
               }
             }
 
