@@ -64,6 +64,24 @@ jobs:
           mkdir -p shared/${MATRIX_REF_NAME}-charts
           if [ -f "${MATRIX_CHART}/Chart.yaml" ]; then
             helm dependency update "${MATRIX_CHART}"
+
+            # Render under the chart directory's name rather than letting helm fall back to its
+            # `release-name` default. Charts using the stock `fullname` helper prefix resources
+            # with the release name, so the default produces names like `release-name-lando-web`,
+            # which match neither production nor a mozcloud chart naming resources from
+            # `app_code`. Because the diff matches resources on apiVersion/kind/metadata.name, a
+            # mismatched release name makes every resource look deleted and re-added.
+            #
+            # The directory name is what Argo CD uses by default: the ApplicationSet sets
+            # `releaseName` from its `$chartName`, which is the chart's directory under
+            # `<app_code>/k8s/`. This also matches how validate-k8s-manifests.yml renders.
+            # Deliberately not the `name` field from Chart.yaml, which differs from the
+            # directory for a handful of charts and is not what Argo uses.
+            #
+            # Charts with a `release_name` override in their tenant config are not handled;
+            # those live in another repository and are not visible here.
+            release_name=$(basename "${MATRIX_CHART}")
+
             values_files=$(find "$MATRIX_CHART" -maxdepth 1 -type f \( -name '*values*.yaml' -o -name '*values*.yml' \) ! \( -name 'values.yaml' -o -name 'values.yml' \))
 
             for values_path in ${values_files}; do
@@ -77,18 +95,32 @@ jobs:
 
               if [[ -n "$region" && -f "${MATRIX_CHART}/values-${env}.yaml" ]]; then
                 # Render with three layers: base, env, env-region
-                helm template "${MATRIX_CHART}" \
+                helm template "${release_name}" "${MATRIX_CHART}" \
                   -f "${MATRIX_CHART}/values.yaml" \
                   -f "${MATRIX_CHART}/values-${env}.yaml" \
                   -f "${MATRIX_CHART}/${values_file}" \
                   --output-dir "$render_path"
               else
                 # Only base + environment file
-                helm template "${MATRIX_CHART}" \
+                helm template "${release_name}" "${MATRIX_CHART}" \
                   -f "${MATRIX_CHART}/values.yaml" \
                   -f "${MATRIX_CHART}/${values_file}" \
                   --output-dir "$render_path"
               fi
+
+              # Concatenate this config's rendered manifests into one multi-document YAML,
+              # written beside the render directory rather than inside it. Both the diff and the
+              # automerge evaluation consume this, so building it once here means they cannot
+              # drift apart and the work is not repeated. Ordering does not matter: both
+              # consumers match documents on apiVersion/kind/metadata.name.
+              manifest="shared/${MATRIX_REF_NAME}-charts/${MATRIX_CHART}/${output_name}.yaml"
+
+              : > "$manifest"
+
+              find "$render_path" -type f | sort | while read -r rendered; do
+                cat "$rendered" >> "$manifest"
+                echo "" >> "$manifest"  # ensure newline between files
+              done
            done
           fi
           echo sanitized_name=$(echo "${MATRIX_CHART}" | sed 's/\//-/g') >> $GITHUB_OUTPUT
@@ -115,72 +147,510 @@ jobs:
           merge-multiple: true
           path: "shared"
 
-      - name: diff helm charts
-        id: diff_helm_charts
+      # TODO Move this step into a separate action with tool cache support
+      - name: install dyff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for chart in ${CHARTS}; do
-            chart_diff_output=$(diff -r "shared/base-charts/${chart}" "shared/head-charts/${chart}" || true)
-            if [ -n "$chart_diff_output" ]; then
-              echo -e "Changes found in chart: ${chart}\n$(diff -ruN shared/base-charts/${chart} shared/head-charts/${chart})\n" >> diff.log
-            fi
-          done
+          set -euo pipefail
+
+          gh release download v1.12.0 -R homeport/dyff -p "dyff_*_linux_amd64.tar.gz" -O - | tar xzf - dyff
+          mv dyff /usr/local/bin
+
+      - name: diff helm charts
         env:
           CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p diff
+          : > diff/index.tsv
+
+          for chart in ${CHARTS}; do
+            mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
+
+            # The `render_charts` job already concatenated each config into a single
+            # multi-document YAML beside its render directory, so enumerate those.
+            # `-exec basename` rather than `xargs` so that a chart which rendered nothing
+            # yields an empty list instead of invoking basename with no operands.
+            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -exec basename {} .yaml \; | sort | uniq)
+
+            for config in ${CONFIGS}; do
+              # When a values file is added or removed only one side renders it, so stand in an
+              # empty manifest for the missing side rather than skipping the config
+              for side in base head; do
+                MANIFEST="shared/${side}-charts/${chart}/${config}.yaml"
+                [ -f "$MANIFEST" ] || : > "$MANIFEST"
+              done
+
+              OUTPUT_FILE="diff/${chart}/${config}.diff"
+              mkdir -p "$(dirname "$OUTPUT_FILE")"
+
+              # `--detect-kubernetes` and `--detect-renames` are dyff defaults; passed explicitly
+              # because they are the whole point of using dyff here
+              if ! dyff between \
+                --output github \
+                --omit-header \
+                --ignore-order-changes \
+                --ignore-whitespace-changes \
+                --detect-kubernetes \
+                --detect-renames \
+                "shared/base-charts/${chart}/${config}.yaml" \
+                "shared/head-charts/${chart}/${config}.yaml" > "$OUTPUT_FILE" 2> "${OUTPUT_FILE}.err"; then
+                # Surface the failure in the comment rather than failing the whole job, so one
+                # unparseable config cannot suppress the diff for every other chart
+                { echo "DYFF_ERROR"; cat "${OUTPUT_FILE}.err"; } > "$OUTPUT_FILE"
+              fi
+
+              BASE_DOCS=$(grep -c '^kind:' "shared/base-charts/${chart}/${config}.yaml" || true)
+              HEAD_DOCS=$(grep -c '^kind:' "shared/head-charts/${chart}/${config}.yaml" || true)
+
+              printf '%s\t%s\t%s\t%s\t%s\n' "$chart" "$config" "$OUTPUT_FILE" "$BASE_DOCS" "$HEAD_DOCS" >> diff/index.tsv
+            done
+          done
 
       - name: post diff as comment on pull request
         if: needs.get_changed_helm_charts.outputs.charts != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
         with:
           script: |
             const fs = require('fs');
-            const comment_char_limit = 65536; // GitHub comment character limit
-            const diff_file = 'diff.log';
 
-            if (fs.existsSync(diff_file)) {
-              var diff = fs.readFileSync(diff_file, 'utf8');
-            } else {
-              console.log(diff_file + " not found")
-              return
+            const COMMENT_CHAR_LIMIT = 65536; // GitHub comment character limit
+            // Identifies our own comments so superseded ones can be folded away on the next push
+            const MARKER = '<!-- mozilla/deploy-actions:diff-rendered-charts -->';
+            const INDEX_FILE = 'diff/index.tsv';
+
+            // Fold away diffs from previous pushes, the way the Atlantis bot hides stale plans.
+            // They stay in the timeline but collapse, so a long-lived migration PR does not
+            // accumulate pages of dead output.
+            async function hideSupersededComments() {
+              const existing = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+
+              for (const comment of existing.filter((c) => (c.body || '').includes(MARKER))) {
+                try {
+                  await github.graphql(
+                    `mutation($id: ID!) {
+                       minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+                         clientMutationId
+                       }
+                     }`,
+                    { id: comment.node_id },
+                  );
+                } catch (error) {
+                  core.warning(`Could not minimize comment ${comment.id}: ${error.message}`);
+                }
+              }
             }
 
-            function splitComment(comment, maxSize, sepEnd, sepStart, comStart) {
-              // Adapted from Atlantis SplitComment function
-              // https://github.com/runatlantis/atlantis/blob/main/server/events/vcs/common/common.go#L18
-              if (comment.length <= (comment_char_limit - comStart.length)) {
-                return [comStart + diff]
-              }
-              maxWithSep = comment_char_limit - sepEnd.length - sepStart.length;
-              var comments = [];
-              var numComments = Math.ceil(comment.length / maxWithSep);
-              for (var i = 0; i < numComments; i++) {
-                var upTo = Math.min(comment.length, (i + 1) * maxWithSep);
-                var portion = comment.slice(i * maxWithSep, upTo);
-                if (i < numComments - 1) {
-                  portion += sepEnd;
+            // dyff's github output is a sequence of blocks:
+            //
+            //   @@ <path> @@
+            //   # <apiVersion>/<Kind>/<name>
+            //   ! <description of the change>
+            //   +/- <values>
+            //
+            // dyff emits these in document order, so every block for a resource is already
+            // contiguous. Only the hierarchy is inverted for a reader: each block leads with the
+            // field path and names the resource underneath, so one Deployment reads as a dozen
+            // unrelated blocks. Group them so the resource is the heading instead, which is how
+            // Argo CD presents a diff.
+            //
+            // A path of `(root level)` paired with a document added/removed description means the
+            // resource as a whole appeared or disappeared; anything else is a field-level change.
+            function parseDyff(text) {
+              const blocks = [];
+              let current = null;
+
+              for (const line of text.split('\n')) {
+                const path = line.match(/^@@ (.*) @@$/);
+                const resource = line.match(/^# (.+)$/);
+
+                if (path) {
+                  current = { path: path[1], id: null, lines: [] };
+                  blocks.push(current);
+                } else if (!current) {
+                  continue;
+                } else if (resource && current.id === null) {
+                  current.id = resource[1];
+                } else if (line.length > 0) {
+                  current.lines.push(line);
                 }
-                if (i > 0) {
-                  portion = sepStart + portion
+              }
+
+              const resources = [];
+              for (const block of blocks) {
+                const last = resources[resources.length - 1];
+                if (last && last.id === block.id) {
+                  last.blocks.push(block);
                 } else {
-                  portion = comStart + portion
+                  resources.push({ id: block.id, blocks: [block] });
                 }
-                comments.push(portion);
               }
+
+              for (const resource of resources) {
+                const details = resource.blocks.flatMap((b) => b.lines.filter((l) => l.startsWith('!')));
+                const isRoot = (b) => b.path === '(root level)';
+
+                resource.changeCount = resource.blocks.length;
+                resource.isAddition =
+                  resource.blocks.some(isRoot) && details.some((d) => /one document added/.test(d));
+                resource.isRemoval =
+                  resource.blocks.some(isRoot) && details.some((d) => /one document removed/.test(d));
+
+                // Re-emit each block with its path, minus the now redundant `# resource` line.
+                // Blocks are separated by a blank line so that consecutive changed fields do not
+                // run together into one wall of text.
+                resource.diff = resource.blocks
+                  .map((b) => [`@@ ${b.path} @@`, ...b.lines].join('\n'))
+                  .join('\n\n');
+              }
+
+              return resources;
+            }
+
+            // A release-name mismatch between the two sides shows up as resources appearing in
+            // both Added and Removed with names differing only by a leading prefix, for example
+            // `release-name-lando-web` removed and `lando-web` added. The workflow renders under
+            // the chart directory name, which is Argo's default, but a chart whose tenant config
+            // sets `release_name` renders under something else in production. Those overrides
+            // live in another repository and are not visible here, so detect the symptom and say
+            // so rather than presenting a wholesale replacement as if it were real.
+            function detectPrefixMismatch(resources) {
+              const groupOf = (id) => id.split('/').slice(0, -1).join('/'); // apiVersion/Kind
+              const nameOf = (id) => id.split('/').pop();
+
+              const addedByGroup = new Map();
+              for (const r of resources.filter((r) => r.isAddition)) {
+                const group = groupOf(r.id);
+                if (!addedByGroup.has(group)) addedByGroup.set(group, []);
+                addedByGroup.get(group).push(nameOf(r.id));
+              }
+
+              // Length of the shared trailing run of `-` separated segments. Comparing segments
+              // rather than raw strings is what catches a prefix being *replaced* rather than
+              // merely added: `treeherder-web` versus `treeherder-v2-web` share the tail `web`
+              // but neither name is a suffix of the other.
+              const sharedTail = (a, b) => {
+                let n = 0;
+                while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) {
+                  n += 1;
+                }
+                return n;
+              };
+
+              const deltas = new Map();
+              for (const r of resources.filter((r) => r.isRemoval)) {
+                const removed = nameOf(r.id).split('-');
+                for (const addedName of addedByGroup.get(groupOf(r.id)) || []) {
+                  const added = addedName.split('-');
+                  const shared = sharedTail(removed, added);
+
+                  // Need a shared tail, and the names must not be identical
+                  if (shared === 0) continue;
+                  if (shared === removed.length && shared === added.length) continue;
+
+                  const from = removed.slice(0, removed.length - shared).join('-');
+                  const to = added.slice(0, added.length - shared).join('-');
+                  if (from === to) continue;
+
+                  const delta = `${from || '(none)'} -> ${to || '(none)'}`;
+                  deltas.set(delta, (deltas.get(delta) || 0) + 1);
+                }
+              }
+
+              // Requiring the same delta at least twice keeps this tight: two unrelated
+              // resources would have to disagree in exactly the same way to trigger it.
+              let best = null;
+              for (const [delta, count] of deltas) {
+                if (count >= 2 && (!best || count > best.count)) best = { delta, count };
+              }
+              return best;
+            }
+
+            // Cross-check the classification against the document counts recorded by the diff
+            // step: the net change in document count must equal added minus removed. parseDyff
+            // keys on dyff's own wording ("one document added"), so if that wording ever changes
+            // every resource would quietly fall into Updated and the summary would mislead while
+            // still looking plausible. This turns that silent drift into a warning.
+            function checkDocumentCounts(entry, resources) {
+              const recorded = Number(entry.headDocs) - Number(entry.baseDocs);
+              const classified =
+                resources.filter((r) => r.isAddition).length -
+                resources.filter((r) => r.isRemoval).length;
+
+              if (Number.isFinite(recorded) && recorded !== classified) {
+                core.warning(
+                  `${entry.chart} / ${entry.config}: rendered document count changed by ` +
+                    `${recorded}, but the diff accounts for ${classified}. The summary may be ` +
+                    `inaccurate; the diff itself is unaffected.`,
+                );
+              }
+            }
+
+            // The per-config heading. The resources themselves follow as collapsible sections
+            // grouped under Updated / Added / Removed, rather than being listed by name here and
+            // then again below: naming each resource twice made the comment longer and forced the
+            // name list to be truncated on large diffs.
+            function renderSummary(entry, resources, mismatch) {
+              const changes = resources.reduce((n, r) => n + r.changeCount, 0);
+
+              let body = `### \`${entry.chart}\` / \`${entry.config}\`\n\n`;
+              body += `**${changes} ${changes === 1 ? 'change' : 'changes'}`;
+              body += ` across ${resources.length}`;
+              body += ` ${resources.length === 1 ? 'resource' : 'resources'}**`;
+              body += ` (${entry.baseDocs} → ${entry.headDocs} documents)\n\n`;
+
+              if (mismatch) {
+                body += `> **This diff is probably misleading.** ${mismatch.count} resources appear as `;
+                body += `both added and removed, with names differing only in their prefix `;
+                body += `(\`${mismatch.delta}\`). That usually means the two sides were rendered under `;
+                body += `different Helm release names, so resources that actually correspond could not `;
+                body += `be matched up.\n>\n`;
+                body += `> Charts are rendered under their directory name, which is what Argo CD uses `;
+                body += `unless the tenant config sets \`release_name\`. Migrated charts often name `;
+                body += `resources with the release name baked in, to avoid recreating them, so a chart `;
+                body += `with such an override will diff against a prefix it never uses in production. `;
+                body += `Treat the added and removed sections as one set of resources, not two.\n\n`;
+              }
+
+              return body;
+            }
+
+            function renderCategoryHeading(label, count) {
+              return `**${label} (${count})**\n\n`;
+            }
+
+            // Render one slice of a resource's diff. Each resource is its own collapsible section
+            // so a reviewer expands only what they care about, and every section is independently
+            // valid: its own <details> opened and closed, its own fence opened and closed. That
+            // matters because a comment can end mid-resource.
+            function renderDiffPart(resource, body, isContinuation, isFinal) {
+              const suffix = isContinuation ? ' (continued)' : '';
+              const n = resource.changeCount;
+              const detail = resource.isAddition
+                ? 'added'
+                : resource.isRemoval
+                  ? 'removed'
+                  : `${n} ${n === 1 ? 'change' : 'changes'}`;
+
+              let out = `<details><summary><code>${resource.id}</code> — ${detail}${suffix}</summary>\n\n`;
+              out += '```diff\n' + body.replace(/\n+$/, '') + '\n```\n</details>\n\n';
+              if (!isFinal) {
+                out += '**Note**: output exceeds the maximum comment size, continued in the next comment.\n\n';
+              }
+              return out;
+            }
+
+            // Pack chunks into as few comments as possible. Diff chunks are sliced on line
+            // boundaries when they cannot fit, each slice individually wrapped. Every comment
+            // begins with MARKER so that all of them, not just the first, are found and folded
+            // away on the next push.
+            function packComments(header, chunks) {
+              const continued = `${MARKER}\nContinued from previous comment.\n\n`;
+              const comments = [];
+              let current = header;
+              let hasContent = false;
+
+              const append = (text) => {
+                current += text;
+                hasContent = true;
+              };
+
+              const flush = () => {
+                if (hasContent) comments.push(current);
+                current = continued;
+                hasContent = false;
+              };
+
+              for (const chunk of chunks) {
+                if (chunk.kind === 'text') {
+                  if (hasContent && current.length + chunk.body.length > COMMENT_CHAR_LIMIT) {
+                    flush();
+                  }
+                  append(chunk.body);
+                  continue;
+                }
+
+                // Overhead is measured with the continuation suffix and the note present, so it
+                // is the worst case and can never under-reserve.
+                const overhead = renderDiffPart(chunk.resource, '', true, false).length;
+                const lines = chunk.resource.diff.replace(/\n+$/, '').split('\n');
+
+                let index = 0;
+                let isContinuation = false;
+
+                while (index < lines.length) {
+                  const available = COMMENT_CHAR_LIMIT - current.length - overhead;
+
+                  // Too little room left to make useful progress; start a fresh comment
+                  if (available < 1024 && hasContent) {
+                    flush();
+                    continue;
+                  }
+
+                  const taken = [];
+                  let used = 0;
+                  while (index < lines.length && used + lines[index].length + 1 <= available) {
+                    used += lines[index].length + 1;
+                    taken.push(lines[index]);
+                    index += 1;
+                  }
+
+                  // A single line longer than a whole comment. Truncate it rather than loop
+                  // forever, and say so.
+                  if (taken.length === 0) {
+                    taken.push(`${lines[index].slice(0, Math.max(1, available - 64))} [line truncated]`);
+                    index += 1;
+                  }
+
+                  const isFinal = index >= lines.length;
+                  append(renderDiffPart(chunk.resource, taken.join('\n'), isContinuation, isFinal));
+                  isContinuation = true;
+
+                  if (!isFinal) flush();
+                }
+              }
+
+              flush();
               return comments;
             }
 
-            var sepEnd = "\n```\n</details>" + "\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment.";
-            var sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-            var comStart = "Changes found in Helm charts.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
+            if (!fs.existsSync(INDEX_FILE)) {
+              console.log(`${INDEX_FILE} not found, nothing to report`);
+              return;
+            }
 
-            comments = splitComment(diff, comment_char_limit, sepEnd, sepStart, comStart);
+            const entries = fs
+              .readFileSync(INDEX_FILE, 'utf8')
+              .split('\n')
+              .filter((line) => line.trim().length > 0)
+              .map((line) => {
+                const [chart, config, diffPath, baseDocs, headDocs] = line.split('\t');
+                return { chart, config, diffPath, baseDocs, headDocs };
+              });
 
-            for (const comment of comments) {
+            // A chart was detected as changed but nothing rendered for it, so there is nothing to
+            // compare. Do not fall through to the "no changes" message below: that would claim the
+            // rendered manifests are identical when in truth none were produced. Usually means the
+            // chart has no per-environment values files, or a changed path is not a chart root.
+            if (entries.length === 0) {
+              core.warning(
+                'No rendered manifests were found for the changed charts, so no diff could be ' +
+                  'produced. Check whether the changed paths are chart roots with per-environment ' +
+                  'values files.',
+              );
+              return;
+            }
+
+            const changed = [];
+            const failed = [];
+            const unchanged = [];
+
+            for (const entry of entries) {
+              const diff = fs.existsSync(entry.diffPath)
+                ? fs.readFileSync(entry.diffPath, 'utf8')
+                : '';
+
+              if (diff.startsWith('DYFF_ERROR')) {
+                failed.push({ entry, message: diff.replace(/^DYFF_ERROR\n?/, '') });
+              } else if (diff.trim().length > 0) {
+                const resources = parseDyff(diff);
+                checkDocumentCounts(entry, resources);
+
+                const mismatch = detectPrefixMismatch(resources);
+                if (mismatch) {
+                  core.warning(
+                    `${entry.chart} / ${entry.config}: ${mismatch.count} resources differ only in ` +
+                      `their name prefix (${mismatch.delta}) between the two sides, which suggests ` +
+                      `they were rendered under different Helm release names. The diff for this ` +
+                      `config is likely misleading.`,
+                  );
+                }
+
+                changed.push({ entry, resources, mismatch });
+              } else {
+                unchanged.push(entry);
+              }
+            }
+
+            await hideSupersededComments();
+
+            if (changed.length === 0 && failed.length === 0) {
               await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: comment
-              })
+                body: `${MARKER}\n## Helm chart diff\n\nNo changes to the rendered Kubernetes manifests.`,
+              });
+              return;
+            }
+
+            let header = `${MARKER}\n## Helm chart diff\n\n`;
+            header += 'Rendered manifests compared by resource identity (`apiVersion`, `kind`, `metadata.name`), ';
+            header += 'so resources are matched even when templates move to new paths.\n\n';
+
+            // Call out configs that rendered identically. On a migration PR a no-op config is
+            // the desired outcome, so its absence from the diff should not be left implicit.
+            if (unchanged.length > 0) {
+              const listed = unchanged.map((e) => `\`${e.chart}\` / \`${e.config}\``).join(', ');
+              header += `No changes to the rendered manifests for ${listed}.\n\n`;
+            }
+
+            const chunks = [];
+
+            for (const { entry, message } of failed) {
+              chunks.push({
+                kind: 'text',
+                body:
+                  `### \`${entry.chart}\` / \`${entry.config}\`\n\n` +
+                  `Could not produce a diff for this config.\n\n\`\`\`\n${message.trim()}\n\`\`\`\n\n`,
+              });
+            }
+
+            for (const item of changed) {
+              chunks.push({ kind: 'text', body: renderSummary(item.entry, item.resources, item.mismatch) });
+
+              // Sort by identity rather than leaving the upstream order in place. dyff emits in
+              // document order and `diff -ruN` in filename order, neither of which is stable or
+              // predictable for a reader looking for a particular resource.
+              const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+              const categories = [
+                ['Updated', item.resources.filter((r) => !r.isAddition && !r.isRemoval).sort(byId)],
+                ['Added', item.resources.filter((r) => r.isAddition).sort(byId)],
+                ['Removed', item.resources.filter((r) => r.isRemoval).sort(byId)],
+              ];
+
+              for (const [label, resources] of categories) {
+                if (resources.length === 0) continue;
+                chunks.push({ kind: 'text', body: renderCategoryHeading(label, resources.length) });
+                for (const resource of resources) {
+                  chunks.push({ kind: 'diff', resource });
+                }
+              }
+            }
+
+            for (const body of packComments(header, chunks)) {
+              // Backstop: packComments keeps bodies under the limit, but never let an
+              // oversized body be rejected by the API without saying so out loud
+              let safe = body;
+              if (safe.length > COMMENT_CHAR_LIMIT) {
+                const truncated = '\n\n**Note**: output truncated to fit the maximum comment size.';
+                safe = safe.slice(0, COMMENT_CHAR_LIMIT - truncated.length) + truncated;
+                core.warning(`Comment body exceeded ${COMMENT_CHAR_LIMIT} characters and was truncated`);
+              }
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: safe,
+              });
             }
 
   evaulate_helm_chart_automerge:
@@ -237,31 +707,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          shopt -s nullglob
-
           for chart in ${CHARTS}; do
-            # When adding or removing a values file the `render_charts` job will only render one side of the chart to be compared
-            # Create the directory to be compared if it doesn't exist so `find` succeeds
             mkdir -p "shared/base-charts/${chart}" "shared/head-charts/${chart}"
 
-            CONFIGS=`find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs --null basename -a | sort | uniq`
+            # The `render_charts` job already concatenated each config into a single
+            # multi-document YAML beside its render directory, so enumerate those.
+            # `-exec basename` rather than `xargs` so that a chart which rendered nothing
+            # yields an empty list instead of invoking basename with no operands, which GNU
+            # xargs would do and which fails the step under `set -euo pipefail`.
+            CONFIGS=$(find "shared/base-charts/${chart}" "shared/head-charts/${chart}" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -exec basename {} .yaml \; | sort | uniq)
 
             mkdir -p diff/${chart}
 
             for config in ${CONFIGS}; do
-              for dir in "shared/base-charts/${chart}/${config}" "shared/head-charts/${chart}/${config}"; do
-                # Create the directory to be compared if it doesn't exist so `find` succeeds
-                mkdir -p "${dir}"
-
-                OUTPUT_FILE="${dir}.yaml"
-
-                touch "$OUTPUT_FILE"
-
-                # Recursively find and concatenate all files
-                find "$dir" -type f | sort | while read -r file; do
-                  cat "$file" >> "$OUTPUT_FILE"
-                  echo "" >> "$OUTPUT_FILE"  # ensure newline between files
-                done
+              # When a values file is added or removed only one side renders it, so stand in an
+              # empty manifest for the missing side rather than skipping the config
+              for side in base head; do
+                MANIFEST="shared/${side}-charts/${chart}/${config}.yaml"
+                [ -f "$MANIFEST" ] || : > "$MANIFEST"
               done
 
               diffnest --format json-patch "shared/base-charts/${chart}/${config}.yaml" "shared/head-charts/${chart}/${config}.yaml" > "diff/${chart}/${config}.json" || true
