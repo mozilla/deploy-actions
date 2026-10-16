@@ -1,0 +1,404 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Claude Review
+description: >-
+  Reviews a pull request's Terraform plans (Atlantis, Spacelift), Helm diff and code with
+  Claude and returns the review as an output. Claude has no GitHub write access here;
+  pair with claude-review/post to publish the result.
+
+inputs:
+  anthropic_api_key:
+    description: Anthropic API key.
+    required: true
+  pr_number:
+    description: Pull request number to review.
+    required: true
+  github_token:
+    description: GitHub token with contents:read and pull-requests:read. Nothing in this action writes to GitHub.
+    required: false
+    default: ${{ github.token }}
+  trigger:
+    description: >-
+      What started this review: on-demand, atlantis-plan, spacelift-plan, helm-diff or
+      pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.
+    required: false
+    default: on-demand
+  atlantis_bot:
+    description: GitHub login of the Atlantis app that posts plan comments.
+    required: false
+    default: atlantis-admin[bot]
+  spacelift_bot:
+    description: GitHub login of the Spacelift app that posts run comments.
+    required: false
+    default: spacelift-io[bot]
+  helm_diff_artifact:
+    description: >-
+      Name of an artifact in this workflow run containing `diff.log` from diff-rendered-charts.
+      When empty, the Helm diff is read from the PR comments instead.
+    required: false
+    default: ""
+  extra_prompt:
+    description: Repository-specific review instructions appended to the base prompt.
+    required: false
+    default: ""
+  model:
+    description: Claude model. Empty uses the claude-code-action default.
+    required: false
+    default: ""
+  fallback_model:
+    description: Fallback model if the primary is unavailable. Empty uses the default.
+    required: false
+    default: ""
+  budget:
+    description: Maximum spend per review in USD.
+    required: false
+    default: "6.00"
+  debounce_seconds:
+    description: Seconds to wait before collecting context when triggered by a plan comment.
+    required: false
+    default: "45"
+
+outputs:
+  review:
+    description: >-
+      Single-line JSON for claude-review/post: {pr_number, head_sha, state, description, body,
+      error}. Empty when the PR was not reviewed.
+    value: ${{ steps.result.outputs.review }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve pull request
+      id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        CTX: ${{ runner.temp }}/claude-review
+      run: |
+        set -euo pipefail
+        mkdir -p "$CTX"
+        # Fail closed: any API error is treated as "not reviewable".
+        if ! gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$CTX/pull.json"; then
+          echo "::error::Could not read pull request #$PR_NUMBER."
+          exit 1
+        fi
+        HEAD_REPO=$(jq -r '.head.repo.full_name // ""' "$CTX/pull.json")
+        if [[ "$HEAD_REPO" != "$REPOSITORY" ]]; then
+          echo "::error::Refusing to review: PR head is in '$HEAD_REPO', not '$REPOSITORY'."
+          exit 1
+        fi
+        jq '{number, title, body, state, draft, author: .user.login, author_type: .user.type,
+             base_ref: .base.ref, head_sha: .head.sha, html_url, changed_files}' "$CTX/pull.json" > "$CTX/pr.json"
+        gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename' \
+          | jq -R . | jq -s '{changed_file_names: .}' > "$CTX/files.json"
+        jq -s '.[0] + .[1]' "$CTX/pr.json" "$CTX/files.json" > "$CTX/pr.tmp" && mv "$CTX/pr.tmp" "$CTX/pr.json"
+        rm -f "$CTX/pull.json" "$CTX/files.json"
+        echo "head_sha=$(jq -r .head_sha "$CTX/pr.json")" >> "$GITHUB_OUTPUT"
+        echo "ctx=$CTX" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for sibling plan comments
+      if: ${{ inputs.trigger == 'atlantis-plan' || inputs.trigger == 'spacelift-plan' }}
+      shell: bash
+      env:
+        SECONDS_TO_WAIT: ${{ inputs.debounce_seconds }}
+      run: |
+        # Atlantis splits large plans across comments and Spacelift posts one comment per
+        # stack, all within seconds of the comment that triggered this run.
+        echo "Waiting ${SECONDS_TO_WAIT}s for the remaining plan comments to land."
+        sleep "${SECONDS_TO_WAIT}"
+
+    - name: Download Helm diff artifact
+      if: ${{ inputs.helm_diff_artifact != '' }}
+      uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 #v8.0.0
+      with:
+        name: ${{ inputs.helm_diff_artifact }}
+        path: ${{ runner.temp }}/claude-review/helm-diff
+
+    # Fixed queries: nothing in the PR can steer what gets fetched.
+    - name: Collect plan, diff and discussion context
+      id: collect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        CTX: ${{ steps.pr.outputs.ctx }}
+        TRIGGER: ${{ inputs.trigger }}
+        ATLANTIS_BOT: ${{ inputs.atlantis_bot }}
+        SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
+        HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
+      run: |
+        set -euo pipefail
+        cd "$CTX"
+
+        # All PR comments, oldest first, with the minimized flag (REST does not expose it).
+        gh api graphql --paginate -F owner="${REPOSITORY%/*}" -F repo="${REPOSITORY#*/}" -F pr="$PR_NUMBER" \
+          --jq '.data.repository.pullRequest.comments.nodes[]' -f query='
+          query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pr) {
+                comments(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { url createdAt isMinimized body author { login __typename } }
+                }
+              }
+            }
+          }' | jq -s 'map(select(.isMinimized | not)) | sort_by(.createdAt)' > comments.json
+
+        # Bot logins may be given with or without the "[bot]" suffix.
+        strip() { printf '%s' "$1" | sed 's/\[bot\]$//'; }
+        ATLANTIS=$(strip "$ATLANTIS_BOT")
+        SPACELIFT=$(strip "$SPACELIFT_BOT")
+
+        # Hidden HTML comments are a classic injection channel; markers are matched before stripping.
+        render() {  # $1 = jq filter selecting comments, $2 = output file, $3 = heading
+          local n
+          n=$(jq "[.[] | select($1)] | length" comments.json)
+          if [[ "$n" -gt 0 ]]; then
+            {
+              echo "# $3"
+              echo
+              jq -r "[.[] | select($1)][] | \"## \(.author.login) at \(.createdAt)\n<\(.url)>\n\n\(.body)\n\"" comments.json \
+                | sed -E 's/<!--[^>]*-->//g'
+            } > "$2"
+          fi
+          echo "$n"
+        }
+
+        ATL_SEL='(.author.login | sub("\\[bot\\]$"; "")) == "'"$ATLANTIS"'" and (.body | test("^Ran (Plan|Apply)|^Continued (plan|apply) output|Locks and plans deleted|currently locked|No changes. Your infrastructure|plan failed|Plan Error"; "i"))'
+        SPL_SEL='(.author.login | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
+        HELM_SEL='(.author.__typename == "Bot") and (.body | test("<!-- helm-diff -->|^Changes found in Helm charts\\.|^Continued from previous comment\\."))'
+        KUBE_SEL='(.author.__typename == "Bot") and (.body | test("<!-- kubeconform-marker -->"))'
+        HUMAN_SEL='(.author.__typename != "Bot") and ((.body | test("@claude")) | not)'
+
+        N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
+        N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
+        N_KUBE=$(render "$KUBE_SEL" validation.md "Manifest validation")
+        N_HUMAN=$(render "$HUMAN_SEL" discussion.md "Human discussion (untrusted, oldest first)")
+
+        # Is the newest Atlantis message an unlock or lock notice? Then the plan is stale/missing.
+        ATL_STALE=$(jq -r "[.[] | select($ATL_SEL)] | last | (.body // \"\") | test(\"Locks and plans deleted|currently locked\")" comments.json)
+
+        HELM_SOURCE="none"
+        if [[ -n "$HELM_ARTIFACT" && -s helm-diff/diff.log ]]; then
+          HELM_SOURCE="artifact"
+        elif [[ -n "$HELM_ARTIFACT" ]]; then
+          echo "::warning::Helm diff artifact '$HELM_ARTIFACT' has no diff.log; falling back to PR comments."
+        fi
+        if [[ "$HELM_SOURCE" == "none" ]]; then
+          N_HELM=$(render "$HELM_SEL" helm-diff.md "Helm diff comments (oldest first; the last 'Changes found' comment and its continuations are current)")
+          [[ "$N_HELM" -gt 0 ]] && HELM_SOURCE="comments"
+        fi
+
+        # Statuses and check runs carry the Atlantis plan summary, lock state and CI results.
+        # Permissions may not allow this; it is optional context.
+        gh pr checks "$PR_NUMBER" --repo "$REPOSITORY" --json name,state,description,link > checks.json 2>/dev/null \
+          || { echo '[]' > checks.json; echo "::notice::Could not read checks for #$PR_NUMBER (missing permission?)."; }
+
+        rm -f comments.json
+        jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" \
+          --argjson atl "$N_ATL" --argjson atl_stale "$ATL_STALE" --argjson spl "$N_SPL" \
+          --argjson kube "$N_KUBE" --argjson human "$N_HUMAN" \
+          '{trigger: $trigger, head_sha: $head,
+            sources: {atlantis_comments: $atl, atlantis_plan_stale_or_locked: $atl_stale,
+                      spacelift_comments: $spl, helm_diff: $helm, validation_comments: $kube,
+                      human_comments: $human}}' > manifest.json
+        echo "Context collected:"; cat manifest.json
+        ls -la "$CTX"
+
+    # Repo-level agent configuration from the PR branch could add hooks or MCP servers that run
+    # with the API key in the environment. The prompt here is the only instruction source.
+    - name: Remove agent configuration from the checkout
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        rm -rf .claude .mcp.json
+        find . -maxdepth 3 -name .mcp.json -exec rm -f {} + 2>/dev/null || true
+
+    - name: Build prompt
+      id: prompt
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        EXTRA_PROMPT: ${{ inputs.extra_prompt }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        REPOSITORY: ${{ github.repository }}
+        CTX: ${{ steps.pr.outputs.ctx }}
+        TRIGGER: ${{ inputs.trigger }}
+      run: |
+        set -euo pipefail
+        DELIM="EOF_$(head -c 8 /dev/urandom | xxd -p)"
+        {
+          echo "content<<$DELIM"
+          echo "You are reviewing pull request #${PR_NUMBER} in repository ${REPOSITORY}."
+          echo "Context directory: ${CTX}"
+          echo "Trigger: ${TRIGGER}"
+          echo "Manifest:"
+          cat "$CTX/manifest.json"
+          echo
+          cat "$ACTION_PATH/prompt.md"
+          if [[ -n "$EXTRA_PROMPT" ]]; then
+            echo
+            echo "## Repository-specific review guidelines"
+            echo
+            echo "$EXTRA_PROMPT"
+          fi
+          echo "$DELIM"
+        } >> "$GITHUB_OUTPUT"
+        echo "schema=$(jq -c . "$ACTION_PATH/schema.json")" >> "$GITHUB_OUTPUT"
+
+    # A prompt injection in the review step cannot reach the artifact/cache API or mint an OIDC
+    # token without these. The Helm artifact was already downloaded above.
+    - name: Unset runner tokens before the agent step
+      shell: bash
+      run: |
+        {
+          echo "ACTIONS_RUNTIME_TOKEN="
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN="
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL="
+        } >> "$GITHUB_ENV"
+
+    - name: Run Claude review
+      id: claude
+      # The action throws at the budget cap; the result step still runs.
+      continue-on-error: true
+      # Only the mutable "v1" tag is on the Mozilla org Actions allowlist, so this ref must stay
+      # "@v1". Dependabot ignores this action in .github/dependabot.yml for the same reason.
+      uses: anthropics/claude-code-action@v1 # zizmor: ignore[unpinned-uses]
+      env:
+        CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" # Keeps secrets out of Claude's shell commands.
+      with:
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        # An explicit token stops the action from minting a Claude App OIDC token (needs id-token: write).
+        github_token: ${{ inputs.github_token }}
+        # Plan comments are authored by apps; the action rejects bot actors unless listed.
+        allowed_bots: ${{ inputs.atlantis_bot }},${{ inputs.spacelift_bot }}
+        include_fix_links: false
+        prompt: ${{ steps.prompt.outputs.content }}
+        # Path rules: "/x" anchors at the workspace, "//x" is the filesystem root.
+        claude_args: |
+          ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
+          ${{ inputs.fallback_model && format('--fallback-model {0}', inputs.fallback_model) || '' }}
+          --max-budget-usd ${{ inputs.budget }}
+          --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments or edit files; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to gh pr diff and gh pr view."
+          --json-schema '${{ steps.prompt.outputs.schema }}'
+          --allowedTools Read Grep Glob
+          --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
+          --allowedTools "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
+
+    # Runs after a failure too, so a budget cap or crash still produces a legible result.
+    - name: Prepare review
+      id: result
+      if: ${{ !cancelled() && steps.claude.outcome != 'skipped' }}
+      shell: bash
+      env:
+        OUTCOME: ${{ steps.claude.outcome }}
+        LOG: ${{ steps.claude.outputs.execution_file }}
+        STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+        BUDGET: ${{ inputs.budget }}
+        MODEL: ${{ inputs.model }}
+        TRIGGER: ${{ inputs.trigger }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        CTX: ${{ steps.pr.outputs.ctx }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        RESULT='{}'
+        if [[ -n "$LOG" && -f "$LOG" ]]; then
+          RESULT=$(jq 'map(select(.type == "result")) | last // {}' "$LOG" 2>/dev/null || echo '{}')
+        fi
+        eval "$(jq -r '@sh "COST=\(.total_cost_usd // "?") TURNS=\(.num_turns // "?")
+          SECS=\(if .duration_ms then .duration_ms / 1000 | round else "?" end)
+          SUBTYPE=\(.subtype // "") DENIALS=\(.permission_denials // [] | length)"' <<< "$RESULT")"
+        if [[ "$SUBTYPE" == error_max_budget* ]]; then
+          echo "::warning::Claude stopped at the \$$BUDGET budget cap. Raise the 'budget' input if this repeats."
+        fi
+        if [[ "$DENIALS" -gt 0 ]]; then
+          echo "::warning::Claude had $DENIALS permission denial(s); the review may be incomplete."
+          echo "::group::Permission denials"
+          jq -r '.permission_denials[] | "  \(.tool_name): \(.tool_input.command // (.tool_input | tojson) | gsub("\n"; "\\n"))"' <<< "$RESULT"
+          echo "::endgroup::"
+        fi
+        if [[ -n "$LOG" && -f "$LOG" ]]; then
+          echo "::group::Tool calls"
+          jq -r '.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name' "$LOG" 2>/dev/null \
+            | sort | uniq -c | sort -rn || true
+          echo "::endgroup::"
+        fi
+
+        # Validate the structured output; anything else is treated as "no review".
+        if [[ -n "$STRUCTURED" ]] && ! jq -e '.verdict and .status and (.findings | type == "array")' <<< "$STRUCTURED" > /dev/null 2>&1; then
+          echo "::warning::Structured output did not match the schema; treating as no review."
+          STRUCTURED=""
+        fi
+
+        ERROR=""
+        NOTE=""
+        if [[ -z "$STRUCTURED" ]]; then
+          if [[ "$SUBTYPE" == error_max_budget* ]]; then
+            NOTE="> [!WARNING]"$'\n'"> Claude hit the \$$BUDGET budget cap before finishing. No review was produced."
+          else
+            NOTE="> [!WARNING]"$'\n'"> Claude returned no review (step outcome: \`$OUTCOME\`). See the [run log]($RUN_URL)."
+            ERROR="Claude review produced no output."
+          fi
+        elif [[ "$OUTCOME" != "success" ]]; then
+          NOTE="> [!WARNING]"$'\n'"> The review step ended with \`$OUTCOME\`; the review may be incomplete."
+        fi
+
+        MANIFEST=$(cat "$CTX/manifest.json" 2>/dev/null || echo '{}')
+        BODY=$(jq -rn --arg note "$NOTE" --arg structured "$STRUCTURED" --arg trigger "$TRIGGER" \
+          --arg cost "$COST" --arg turns "$TURNS" --arg secs "$SECS" --arg model "${MODEL:-default}" --arg run "$RUN_URL" \
+          --argjson manifest "$MANIFEST" '
+          ($structured | if . == "" then null else fromjson end) as $r
+          | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
+          def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
+          [ "<!-- claude-review -->",
+            "### Claude review: " + (if $r == null then "no review produced" else $r.verdict end),
+            "",
+            (if $r == null then "" else
+              "**Status:** " + $r.status
+              + "  |  **Reviewed:** " + (if ($r.sources_reviewed | length) > 0 then ($r.sources_reviewed | join(", ")) else "nothing" end)
+              + (if ($r.sources_missing | length) > 0 then "  |  **Missing:** " + ($r.sources_missing | join(", ")) else "" end)
+            end),
+            "",
+            (if $r == null then "" elif ($r.findings | length) == 0 then "_No findings._" else
+              "#### Findings\n" + ($r.findings | map(
+                "- **" + (.severity | sev) + "** · `" + .source + "` · **" + .title + "**\n  " + (.detail | gsub("\n"; "\n  "))
+                + (if (.references // [] | length) > 0 then "\n  " + (.references | map("`" + . + "`") | join(", ")) else "" end)
+              ) | join("\n")) end),
+            "",
+            (if $r == null or (($r.apply_readiness // []) | length) == 0 then "" else
+              "#### Apply readiness\n" + list($r.apply_readiness; "") end),
+            "",
+            $note,
+            "",
+            "<sub>trigger: " + $trigger + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
+          ] | map(select(. != "")) | join("\n")')
+
+        # Commit status semantics: success = a review was produced (findings or not; humans decide
+        # what blocks), failure = no review could be produced. Making the status required then
+        # means "Claude reviewed it", never "Claude approved it".
+        if [[ -z "$STRUCTURED" ]]; then
+          STATE=failure; DESCRIPTION="No review produced"
+        else
+          STATE=success; DESCRIPTION=$(jq -r '.verdict' <<< "$STRUCTURED" | cut -c1-140)
+        fi
+
+        {
+          echo "### Claude review"
+          echo ""
+          echo "- Trigger: \`$TRIGGER\`, Claude step: \`$OUTCOME\`${SUBTYPE:+ (\`$SUBTYPE\`)}"
+          echo "- $TURNS turns, ${SECS}s, \$$COST of \$$BUDGET"
+          echo "- Verdict: $DESCRIPTION"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        REVIEW=$(jq -cn --arg pr "$PR_NUMBER" --arg sha "$HEAD_SHA" --arg state "$STATE" \
+          --arg description "$DESCRIPTION" --arg body "$BODY" --arg error "$ERROR" \
+          '{pr_number: $pr, head_sha: $sha, state: $state, description: $description, body: $body, error: $error}')
+        echo "review=$REVIEW" >> "$GITHUB_OUTPUT"

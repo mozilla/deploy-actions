@@ -6,3 +6,7 @@ updates:
       default-days: 14
     schedule:
       interval: weekly
+    ignore:
+      # Only the mutable "v1" tag of this action is on the Mozilla org Actions allowlist.
+      # Pinning it to a patch version or SHA makes every caller fail with startup_failure.
+      - dependency-name: "anthropics/claude-code-action"

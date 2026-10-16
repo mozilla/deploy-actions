@@ -14,6 +14,13 @@ on:
         default: false
         required: false
         type: boolean
+    outputs:
+      changes_found:
+        description: "'true' when at least one rendered chart differs between base and head"
+        value: ${{ jobs.diff_helm_charts.outputs.changes_found }}
+      diff_artifact:
+        description: Name of the artifact holding diff.log (empty when nothing changed). Consumed by claude-review.
+        value: ${{ jobs.diff_helm_charts.outputs.diff_artifact }}
 
 jobs:
   get_changed_helm_charts:
@@ -107,6 +114,9 @@ jobs:
     needs:
       - get_changed_helm_charts
       - render_charts
+    outputs:
+      changes_found: ${{ steps.diff_helm_charts.outputs.changes_found }}
+      diff_artifact: ${{ steps.diff_helm_charts.outputs.diff_artifact }}
     steps:
       - name: download artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 #v8.0.0
@@ -124,63 +134,95 @@ jobs:
               echo -e "Changes found in chart: ${chart}\n$(diff -ruN shared/base-charts/${chart} shared/head-charts/${chart})\n" >> diff.log
             fi
           done
+          if [ -s diff.log ]; then
+            echo "changes_found=true" >> "$GITHUB_OUTPUT"
+            echo "diff_artifact=helm-diff-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes_found=false" >> "$GITHUB_OUTPUT"
+            echo "diff_artifact=" >> "$GITHUB_OUTPUT"
+          fi
         env:
           CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
 
-      - name: post diff as comment on pull request
+      # Lets other jobs in this run (e.g. claude-review) read the diff without parsing comments.
+      - name: upload diff artifact
+        if: steps.diff_helm_charts.outputs.changes_found == 'true'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f #v7.0.0
+        with:
+          name: ${{ steps.diff_helm_charts.outputs.diff_artifact }}
+          path: diff.log
+          if-no-files-found: ignore
+
+      - name: minimize previous helm diff comments
         if: needs.get_changed_helm_charts.outputs.charts != ''
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
-            const fs = require('fs');
-            const comment_char_limit = 65536; // GitHub comment character limit
-            const diff_file = 'diff.log';
+            const marker = "<!-- helm-diff -->";
+            const legacyHeaders = ["Changes found in Helm charts.", "Continued from previous comment."];
 
-            if (fs.existsSync(diff_file)) {
-              var diff = fs.readFileSync(diff_file, 'utf8');
-            } else {
-              console.log(diff_file + " not found")
-              return
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            for (const comment of comments) {
+              const isOurs = comment.body.includes(marker) || legacyHeaders.some(h => comment.body.startsWith(h));
+              if (isOurs && comment.user.type === "Bot") {
+                await github.graphql(`
+                  mutation MinimizeComment($subjectId: ID!) {
+                    minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
+                      minimizedComment { isMinimized }
+                    }
+                  }
+                `, { subjectId: comment.node_id });
+              }
             }
 
-            function splitComment(comment, maxSize, sepEnd, sepStart, comStart) {
+      - name: post diff as comment on pull request
+        if: steps.diff_helm_charts.outputs.changes_found == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = "<!-- helm-diff -->";
+            const commentCharLimit = 65536; // GitHub comment character limit
+            const diff = fs.readFileSync('diff.log', 'utf8');
+
+            const sepEnd = "\n```\n</details>\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment.\n" + marker;
+            const sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n```diff\n";
+            const comStart = "Changes found in Helm charts.\n<details><summary>Show Output</summary>\n\n```diff\n";
+            const comEnd = "\n```\n</details>\n" + marker;
+
+            function splitComment(content, maxSize) {
               // Adapted from Atlantis SplitComment function
               // https://github.com/runatlantis/atlantis/blob/main/server/events/vcs/common/common.go#L18
-              if (comment.length <= (comment_char_limit - comStart.length)) {
-                return [comStart + diff]
+              if (content.length <= (maxSize - comStart.length - comEnd.length)) {
+                return [comStart + content + comEnd];
               }
-              maxWithSep = comment_char_limit - sepEnd.length - sepStart.length;
-              var comments = [];
-              var numComments = Math.ceil(comment.length / maxWithSep);
-              for (var i = 0; i < numComments; i++) {
-                var upTo = Math.min(comment.length, (i + 1) * maxWithSep);
-                var portion = comment.slice(i * maxWithSep, upTo);
-                if (i < numComments - 1) {
-                  portion += sepEnd;
-                }
-                if (i > 0) {
-                  portion = sepStart + portion
-                } else {
-                  portion = comStart + portion
-                }
+              const maxWithSep = maxSize - sepEnd.length - sepStart.length - comEnd.length;
+              const numComments = Math.ceil(content.length / maxWithSep);
+              const comments = [];
+              for (let i = 0; i < numComments; i++) {
+                const upTo = Math.min(content.length, (i + 1) * maxWithSep);
+                let portion = content.slice(i * maxWithSep, upTo);
+                portion = (i > 0 ? sepStart : comStart) + portion;
+                portion += (i < numComments - 1) ? sepEnd : comEnd;
                 comments.push(portion);
               }
               return comments;
             }
 
-            var sepEnd = "\n```\n</details>" + "\n<br>\n\n**Warning**: Output length greater than max comment size. Continued in next comment.";
-            var sepStart = "Continued from previous comment.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-            var comStart = "Changes found in Helm charts.\n<details><summary>Show Output</summary>\n\n" + "```diff\n";
-
-            comments = splitComment(diff, comment_char_limit, sepEnd, sepStart, comStart);
-
-            for (const comment of comments) {
+            for (const body of splitComment(diff, commentCharLimit)) {
               await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: comment
-              })
+                body
+              });
             }
 
   evaulate_helm_chart_automerge:
