@@ -1,0 +1,292 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+# Reusable workflow: Claude review of infrastructure pull requests.
+# Reads the PR diff plus whatever change previews exist on the PR (Atlantis plan comments,
+# Spacelift run comments, the Helm diff from diff-rendered-charts) and posts one review comment.
+#
+# Call it from a workflow triggered by `issue_comment` (plan comments and "@claude" requests),
+# `pull_request` (review on open), or as a job after diff-rendered-charts. See
+# .github/workflows/docs/claude-review.md.
+
+name: claude review
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: >-
+          "auto" reviews when Atlantis or Spacelift post a plan comment and on the trigger phrase;
+          "on-demand" only reviews on the trigger phrase.
+        type: string
+        default: auto
+      trigger_phrase:
+        description: Comment text (from a human) that requests a review.
+        type: string
+        default: "@claude"
+      atlantis_bot:
+        description: GitHub login of the Atlantis app that posts plan comments.
+        type: string
+        default: atlantis-admin[bot]
+      spacelift_bot:
+        description: GitHub login of the Spacelift app that posts run comments.
+        type: string
+        default: spacelift-io[bot]
+      helm_diff_artifact:
+        description: Artifact name from diff-rendered-charts (`diff_artifact` output) containing diff.log.
+        type: string
+        default: ""
+      extra_prompt:
+        description: Repository-specific review instructions appended to the base prompt.
+        type: string
+        default: ""
+      model:
+        description: Claude model; empty uses the claude-code-action default.
+        type: string
+        default: ""
+      fallback_model:
+        description: Fallback model; empty uses the default.
+        type: string
+        default: ""
+      budget_usd:
+        description: Maximum spend per review in USD.
+        type: string
+        default: "6.00"
+      debounce_seconds:
+        description: Wait before collecting context when a plan comment triggered the review.
+        type: string
+        default: "45"
+      post_status:
+        description: Also publish a `claude-review` commit status (caller needs statuses:write).
+        type: boolean
+        default: false
+      pr_number:
+        description: Explicit PR number (for workflow_dispatch callers). Otherwise taken from the event.
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key.
+        required: true
+      SLACK_WEBHOOK_URL:
+        description: Optional incoming webhook; the scheduled health check posts there when reviews are failing.
+        required: false
+
+jobs:
+  # Cheap classification. Comments that are not a review trigger are skipped here, before any
+  # runner starts, and never enter the review job's concurrency group.
+  gate:
+    name: gate
+    if: >-
+      github.event_name != 'schedule' &&
+      (github.event_name != 'issue_comment' ||
+      (
+        github.event.issue.pull_request &&
+        (
+          (contains(github.event.comment.body, inputs.trigger_phrase) && github.event.comment.user.type != 'Bot') ||
+          (inputs.mode == 'auto' && github.event.comment.user.login == inputs.atlantis_bot && startsWith(github.event.comment.body, 'Ran Plan')) ||
+          (inputs.mode == 'auto' && github.event.comment.user.login == inputs.spacelift_bot && contains(github.event.comment.body, 'spacelift.io/stack/') && !contains(github.event.comment.body, 'Deploy'))
+        )
+      ))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Posts a short "nothing to review" reply when a human asks on a closed PR.
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+      pr_number: ${{ steps.gate.outputs.pr_number }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      trigger: ${{ steps.gate.outputs.trigger }}
+    steps:
+      - name: Classify trigger and check the pull request
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          EVENT_PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_LOGIN: ${{ github.event.comment.user.login }}
+          COMMENT_TYPE: ${{ github.event.comment.user.type }}
+          TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+          ATLANTIS_BOT: ${{ inputs.atlantis_bot }}
+          SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
+          HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          skip() { echo "::notice::Not reviewing: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          PR_NUMBER="${INPUT_PR:-$EVENT_PR}"
+          [[ -n "$PR_NUMBER" ]] || skip "no pull request number in this event."
+          # A repo can adopt the caller workflow before the secret exists without spamming PRs.
+          [[ "$HAS_API_KEY" == "true" ]] || skip "ANTHROPIC_API_KEY secret is not set in this repository."
+
+          TRIGGER=""
+          case "$EVENT_NAME" in
+            issue_comment)
+              if [[ "$COMMENT_TYPE" != "Bot" && "$COMMENT_BODY" == *"$TRIGGER_PHRASE"* ]]; then
+                TRIGGER=on-demand
+              elif [[ "$COMMENT_LOGIN" == "$ATLANTIS_BOT" ]]; then
+                TRIGGER=atlantis-plan
+              elif [[ "$COMMENT_LOGIN" == "$SPACELIFT_BOT" ]]; then
+                TRIGGER=spacelift-plan
+              else
+                skip "comment is not a review trigger."
+              fi
+              ;;
+            pull_request|pull_request_target)
+              [[ "$PR_AUTHOR_TYPE" != "Bot" ]] || skip "pull request opened by a bot; plan comments will still trigger a review."
+              if [[ -n "$HELM_ARTIFACT" ]]; then TRIGGER=helm-diff; else TRIGGER=pull-request; fi
+              ;;
+            *)
+              TRIGGER=on-demand
+              ;;
+          esac
+
+          # Fail closed: an API error means "do not review".
+          PR_JSON=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER") || skip "could not read PR #$PR_NUMBER."
+          STATE=$(jq -r .state <<< "$PR_JSON")
+          DRAFT=$(jq -r .draft <<< "$PR_JSON")
+          HEAD_REPO=$(jq -r '.head.repo.full_name // ""' <<< "$PR_JSON")
+          HEAD_SHA=$(jq -r .head.sha <<< "$PR_JSON")
+
+          [[ "$HEAD_REPO" == "$REPOSITORY" ]] || skip "PR #$PR_NUMBER comes from '$HEAD_REPO' (fork or unknown); secrets are not exposed to it."
+
+          if [[ "$STATE" != "open" ]]; then
+            if [[ "$TRIGGER" == "on-demand" ]]; then
+              # A human asked; answer so the request does not vanish.
+              gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+                -f body="<!-- claude-review -->
+          ### Claude review: not run
+
+          This pull request is **$STATE**; there is nothing current to review." > /dev/null
+            fi
+            skip "PR #$PR_NUMBER is $STATE."
+          fi
+          if [[ "$DRAFT" == "true" && "$TRIGGER" == "pull-request" ]]; then
+            skip "PR #$PR_NUMBER is a draft."
+          fi
+
+          {
+            echo "skip=false"
+            echo "pr_number=$PR_NUMBER"
+            echo "head_sha=$HEAD_SHA"
+            echo "trigger=$TRIGGER"
+          } >> "$GITHUB_OUTPUT"
+          echo "Reviewing PR #$PR_NUMBER ($TRIGGER) at $HEAD_SHA"
+
+  review:
+    name: review
+    needs: gate
+    if: ${{ needs.gate.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One review per PR at a time; a newer plan comment or request supersedes a running review.
+    # Only review triggers reach this job, so unrelated comments cannot cancel it.
+    concurrency:
+      group: claude-review-${{ github.repository }}-${{ needs.gate.outputs.pr_number }}
+      cancel-in-progress: true
+    # Read-only: a token Claude could read is worth little.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      review: ${{ steps.review.outputs.review }}
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # "$/" resolves to this workflow's own repository at the running commit, so the composite
+      # action and its prompt always match this file. Needs runner 2.336.0+ (github.com has it).
+      - name: Claude review
+        id: review
+        uses: $/claude-review
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          pr_number: ${{ needs.gate.outputs.pr_number }}
+          trigger: ${{ needs.gate.outputs.trigger }}
+          atlantis_bot: ${{ inputs.atlantis_bot }}
+          spacelift_bot: ${{ inputs.spacelift_bot }}
+          helm_diff_artifact: ${{ inputs.helm_diff_artifact }}
+          extra_prompt: ${{ inputs.extra_prompt }}
+          model: ${{ inputs.model }}
+          fallback_model: ${{ inputs.fallback_model }}
+          budget: ${{ inputs.budget_usd }}
+          debounce_seconds: ${{ inputs.debounce_seconds }}
+
+  post:
+    name: post
+    needs: [gate, review]
+    # Runs after a failed review job too (to report it), but not after a superseded one.
+    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' && needs.review.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post review
+        uses: $/claude-review/post
+        with:
+          review: ${{ needs.review.outputs.review }}
+          pr_number: ${{ needs.gate.outputs.pr_number }}
+          post_status: ${{ inputs.post_status }}
+
+  # Scheduled self-check (callers add `on: schedule`). A review that never starts, e.g. because
+  # the anthropics/claude-code-action ref fell off the org allowlist, is indistinguishable from a
+  # slow one in the PR thread; this job turns a week of startup_failure into a failing run and,
+  # with SLACK_WEBHOOK_URL set, a Slack message. Needs `actions: read` from the caller.
+  health:
+    name: health check
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Audit recent runs of this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh run list --repo "$REPOSITORY" --workflow "$WORKFLOW" --created ">$SINCE" --limit 500 \
+            --json conclusion,status,event > runs.json
+          SUMMARY=$(jq -r '
+            map(select(.event != "schedule"))
+            | group_by(.conclusion // .status) | map({k: .[0].conclusion // .[0].status, n: length})
+            | sort_by(-.n) | map("| \(.k) | \(.n) |") | join("\n")' runs.json)
+          STARTUP=$(jq '[.[] | select(.conclusion == "startup_failure")] | length' runs.json)
+          FAILED=$(jq '[.[] | select(.event != "schedule" and .conclusion == "failure")] | length' runs.json)
+          OK=$(jq '[.[] | select(.event != "schedule" and .conclusion == "success")] | length' runs.json)
+          {
+            echo "### Claude review health, last 7 days (\`$WORKFLOW\` in $REPOSITORY)"
+            echo
+            echo "| conclusion | runs |"
+            echo "|---|---|"
+            echo "${SUMMARY:-| (no runs) | 0 |}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          PROBLEM=""
+          if [[ "$STARTUP" -gt 0 ]]; then
+            PROBLEM="$STARTUP run(s) ended in startup_failure: the workflow is not starting at all (check the anthropics/claude-code-action ref against the org allowlist)."
+          elif [[ "$FAILED" -gt 0 && "$OK" -eq 0 ]]; then
+            PROBLEM="$FAILED failed run(s) and no successful review in 7 days."
+          fi
+          if [[ -z "$PROBLEM" ]]; then
+            echo "Healthy: $OK successful review run(s), $FAILED failed, $STARTUP startup failures."
+            exit 0
+          fi
+          echo "::error::Claude review unhealthy in $REPOSITORY: $PROBLEM"
+          if [[ -n "$SLACK_WEBHOOK_URL" ]]; then
+            jq -nc --arg text ":rotating_light: Claude review unhealthy in $REPOSITORY: $PROBLEM <$RUN_URL|details>" '{text: $text}' \
+              | curl -fsS -X POST -H 'Content-type: application/json' --data @- "$SLACK_WEBHOOK_URL" > /dev/null \
+              || echo "::warning::Slack notification failed."
+          fi
+          exit 1

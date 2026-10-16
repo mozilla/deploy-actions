@@ -1,0 +1,111 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Post Claude Review
+description: >-
+  Posts the review produced by claude-review as one PR comment (minimizing earlier ones) and,
+  optionally, as a commit status. Run this in a job with pull-requests:write.
+
+inputs:
+  review:
+    description: The `review` output of claude-review. Empty means the review job produced nothing.
+    required: true
+  github_token:
+    description: GitHub token with pull-requests:write (and statuses:write when post_status is true).
+    required: false
+    default: ${{ github.token }}
+  post_status:
+    description: Also publish a commit status on the PR head. success = a review was produced, failure = none.
+    required: false
+    default: "false"
+  status_context:
+    description: Commit status context name.
+    required: false
+    default: claude-review
+  pr_number:
+    description: Fallback PR number when `review` is empty (so a failure can still be reported on the PR).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Post review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPOSITORY: ${{ github.repository }}
+        REVIEW: ${{ inputs.review }}
+        POST_STATUS: ${{ inputs.post_status }}
+        STATUS_CONTEXT: ${{ inputs.status_context }}
+        FALLBACK_PR: ${{ inputs.pr_number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        MARKER="<!-- claude-review -->"
+
+        if [[ -z "$REVIEW" ]]; then
+          if [[ -z "$FALLBACK_PR" ]]; then
+            echo "::error::No review and no PR number; nothing to post."
+            exit 1
+          fi
+          # The review job died before producing output. Say so instead of staying silent.
+          REVIEW=$(jq -cn --arg pr "$FALLBACK_PR" --arg run "$RUN_URL" '{
+            pr_number: $pr, head_sha: "", state: "failure", description: "Review job failed",
+            body: ("<!-- claude-review -->\n### Claude review: not produced\n\n> [!WARNING]\n> The review job failed before returning a result. See the [run log](" + $run + ")."),
+            error: "Claude review job produced no output."}')
+        fi
+        if ! jq -e '.pr_number and .body' <<< "$REVIEW" > /dev/null; then
+          echo "::error::Input is not a claude-review output."
+          exit 1
+        fi
+        PR_NUMBER=$(jq -r .pr_number <<< "$REVIEW")
+        HEAD_SHA=$(jq -r '.head_sha // ""' <<< "$REVIEW")
+        OWNER="${REPOSITORY%/*}"; REPO="${REPOSITORY#*/}"
+
+        # Collapse earlier reviews so the PR shows only the current one.
+        gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F pr="$PR_NUMBER" \
+          --jq '.data.repository.pullRequest.comments.nodes[]' -f query='
+          query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pr) {
+                comments(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { id isMinimized body author { __typename } }
+                }
+              }
+            }
+          }' | jq -r --arg marker "$MARKER" \
+            'select(.author.__typename == "Bot" and (.isMinimized | not) and (.body | contains($marker))) | .id' \
+          | while read -r id; do
+              echo "Minimizing $id"
+              gh api graphql -f id="$id" -f query='mutation($id: ID!) {
+                minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' > /dev/null
+            done
+
+        jq -r .body <<< "$REVIEW" > "$RUNNER_TEMP/claude-review-body.md"
+        # GitHub caps comment bodies at 65536 characters.
+        if [[ $(wc -c < "$RUNNER_TEMP/claude-review-body.md") -gt 65000 ]]; then
+          head -c 64500 "$RUNNER_TEMP/claude-review-body.md" > "$RUNNER_TEMP/claude-review-body.tmp"
+          printf '\n\n_Truncated; see the [run log](%s)._\n' "$RUN_URL" >> "$RUNNER_TEMP/claude-review-body.tmp"
+          mv "$RUNNER_TEMP/claude-review-body.tmp" "$RUNNER_TEMP/claude-review-body.md"
+        fi
+        URL=$(gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+          -F body=@"$RUNNER_TEMP/claude-review-body.md" --jq .html_url)
+        echo "Posted $URL"
+        echo "- Review comment: $URL" >> "$GITHUB_STEP_SUMMARY"
+
+        if [[ "$POST_STATUS" == "true" && -n "$HEAD_SHA" ]]; then
+          STATE=$(jq -r .state <<< "$REVIEW")
+          DESCRIPTION=$(jq -r .description <<< "$REVIEW" | cut -c1-140)
+          gh api --method POST "repos/$REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$STATE" -f context="$STATUS_CONTEXT" -f description="$DESCRIPTION" -f target_url="$URL" > /dev/null \
+            || echo "::warning::Could not set commit status (needs statuses: write)."
+        fi
+
+        ERROR=$(jq -r '.error // ""' <<< "$REVIEW")
+        if [[ -n "$ERROR" ]]; then
+          echo "::error::$ERROR"
+          exit 1
+        fi
