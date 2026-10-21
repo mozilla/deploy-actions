@@ -15,8 +15,12 @@ on:
         default: false
         type: boolean
 
+defaults:
+  run:
+    # The built-in `shell: bash` (-eo pipefail), plus -u to fail on unset variables
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 env:
-  HEAD_REF: ${{ github.head_ref }}
   KUBECONFORM_VERSION: "0.7.0"
   KUBECONFORM_SHA256: "c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3"
   KUBECONFORM_BASE_URL: "https://github.com/yannh/kubeconform/releases/download"
@@ -27,8 +31,7 @@ jobs:
   get_changed_helm_charts:
     runs-on: ubuntu-latest
     outputs:
-      matrix_charts: ${{ steps.find_changed_charts.outputs.matrix_changed_charts }}
-      charts: ${{ steps.find_changed_charts.outputs.changed_charts }}
+      charts: ${{ steps.find_changed_charts.outputs.charts }}
     steps:
       - name: checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
@@ -39,88 +42,44 @@ jobs:
       - name: find changed helm charts
         id: find_changed_charts
         run: |
-          git fetch origin $GITHUB_BASE_REF:$GITHUB_BASE_REF
-          echo matrix_changed_charts=$(git diff --name-only $GITHUB_BASE_REF...HEAD -- '**/k8s/**/*.yaml' '**/k8s/**/*.yml' '**/k8s/**/*.tpl' '**/k8s/**/*.tmpl' | cut -d'/' -f1,2,3 | uniq | jq -R 'split("\n")' | jq -s 'flatten(1)') >> $GITHUB_OUTPUT
-          echo changed_charts=$(git diff --name-only $GITHUB_BASE_REF...HEAD -- '**/k8s/**/*.yaml' '**/k8s/**/*.yml' '**/k8s/**/*.tpl' '**/k8s/**/*.tmpl' | cut -d'/' -f1,2,3 | uniq) >> $GITHUB_OUTPUT
+          git fetch origin "$GITHUB_BASE_REF:$GITHUB_BASE_REF"
+          # Any file in a chart directory can change the rendered output (templates, values, Chart.lock,
+          # .helmignore, files loaded with .Files.Get), so look at every changed file under k8s/
+          # Assigned first so a git diff failure fails the step (it wouldn't inside the for loop's word list)
+          changed_dirs=$(git diff --name-only "$GITHUB_BASE_REF...HEAD" -- ':(glob)**/k8s/**' | cut -d'/' -f1,2,3 | sort -u)
+
+          charts=()
+          for dir in $changed_dirs; do
+            if [ -f "$dir/Chart.yaml" ]; then
+              charts+=("$dir")
+            else
+              echo "::notice::Skipping ${dir}: no Chart.yaml (not a helm chart, or the chart was deleted)"
+            fi
+          done
+          echo "charts=$(jq -cn '$ARGS.positional' --args "${charts[@]}")" >> "$GITHUB_OUTPUT"
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
 
-  render_head_ref_charts:
+  render_and_validate:
     runs-on: ubuntu-latest
     needs: get_changed_helm_charts
+    if: needs.get_changed_helm_charts.outputs.charts != '[]'
     strategy:
+      fail-fast: false
       matrix:
-        chart: ${{ fromJSON(needs.get_changed_helm_charts.outputs.matrix_charts) }}
+        chart: ${{ fromJSON(needs.get_changed_helm_charts.outputs.charts) }}
     steps:
       - name: checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-         persist-credentials: true # We are using these credentials in later steps
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       - name: setup helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 #v4.3.1
 
-      - name: render ${{ matrix.chart }} from head ref
-        id: render_head
-        run: |
-          mkdir -p shared/head-charts
-          git fetch origin "$HEAD_REF"
-          git checkout  "$HEAD_REF" --
-          if [ -f "$MATRIX_CHART/Chart.yaml" ]; then
-            helm dependency update "$MATRIX_CHART"
-
-            while read values_file; do
-              filename=$(basename "${values_file}")
-              filename_without_suffix=${filename%.*}
-
-              env=${filename_without_suffix%*.values}
-              env=${env#values-*}
-
-              helm template $(basename -a "$MATRIX_CHART" ) "$MATRIX_CHART" \
-                -f $values_file \
-                --output-dir shared/charts/$MATRIX_CHART/$filename_without_suffix
-
-              while read region_values_file; do
-                region_filename=$(basename $region_values_file)
-                region_filename_without_suffix=${region_filename%.*}
-
-                helm template $(basename -a "$MATRIX_CHART") "$MATRIX_CHART" \
-                  -f $values_file \
-                  -f $region_values_file \
-                  --output-dir shared/charts/$MATRIX_CHART/$region_filename_without_suffix
-
-              done < <(find "$BASE_DIR/$MATRIX_CHART" \
-                -maxdepth 1 \
-                -type f \
-                -regextype egrep \
-                -regex ".*/values-${env}(-[[:alnum:]]+){2}\.(yaml|yml)$")
-            done < <(find "$BASE_DIR/$MATRIX_CHART" \
-              -maxdepth 1 \
-              -type f \
-              -regextype egrep \
-              -regex ".*/([[:alnum:]]+\.)?values((-ent)?-([[:alnum:]]+))?\.(yaml|yml)$" \
-              -not -regex ".*/values.(yaml|yml)$")
-          fi
-          echo sanitized_name=$(echo "$MATRIX_CHART" | sed 's/\//-/g') >> $GITHUB_OUTPUT
-        env:
-          MATRIX_CHART: ${{ matrix.chart }}
-
-      - name: upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f #v7.0.0
-        with:
-          name: "k8s-manifests-${{ steps.render_head.outputs.sanitized_name }}"
-          path: "shared"
-
-  validate_rendered_helm_chart_manifests:
-    runs-on: ubuntu-latest
-    needs:
-      - get_changed_helm_charts
-      - render_head_ref_charts
-    steps:
       - name: install kubeconform
         run: |
-          set -euo pipefail
-
           FILENAME="kubeconform-linux-amd64.tar.gz"
           DOWNLOAD_URL="${KUBECONFORM_BASE_URL}/v${KUBECONFORM_VERSION}/${FILENAME}"
 
@@ -134,6 +93,82 @@ jobs:
           chmod +x kubeconform
           sudo mv kubeconform /usr/local/bin/kubeconform
 
+      - name: render and validate ${{ matrix.chart }}
+        shell: python
+        run: |
+          import os, subprocess, sys
+          from pathlib import Path
+
+          chart = Path(os.environ["CHART"])
+          out = Path("shared/charts") / chart
+
+          kubeconform = [
+              "kubeconform",
+              "-schema-location", "default",
+              "-schema-location", os.environ["KUBECONFORM_SCHEMA_LOCATION"],
+              "-schema-location", os.environ["KUBECONFORM_CUSTOM_SCHEMA_LOCATION"],
+              "-summary",
+              "-skip", "CustomResourceDefinition",
+          ]
+          if os.environ["STRICT"] == "true":
+              kubeconform.append("-strict")
+
+          # Every top-level yaml file besides Chart.yaml and values.yaml is a values file for one deployment.
+          # It is layered on top of values.yaml and on any values file whose name is a prefix of its own,
+          # e.g. values-prod-us-west1.yaml is layered on values-prod.yaml.
+          values_files = {
+              f.stem: f
+              for f in sorted(chart.glob("*.y*ml"))
+              if f.stem not in ("Chart", "values") and not f.name.startswith(".")
+          }
+          renders = {
+              name: [f for prefix, f in values_files.items() if name.startswith(f"{prefix}-")] + [values_file]
+              for name, values_file in values_files.items()
+          }
+          # Charts without values files of their own are rendered with values.yaml alone
+          if not renders:
+              renders = {"values": []}
+
+          subprocess.run(["helm", "dependency", "update", chart], check=True)
+
+          report = []
+          for name, layers in renders.items():
+              print(f"Rendering {chart} with {', '.join(['values.yaml', *(f.name for f in layers)])}", flush=True)
+              values_args = [arg for f in layers for arg in ("-f", f)]
+              # helm doesn't create the output directory when the chart renders no manifests
+              (out / name).mkdir(parents=True, exist_ok=True)
+              subprocess.run(["helm", "template", chart.name, chart, *values_args, "--output-dir", out / name], check=True)
+
+              # Run from the render directory so the output names files relative to it
+              result = subprocess.run([*kubeconform, "."], cwd=out / name, capture_output=True, text=True)
+              print(result.stdout + result.stderr, flush=True)
+              if result.returncode != 0:
+                  output = f"{result.stdout}{result.stderr}".rstrip()
+                  report.append(f"<details><summary>{chart} ({name})</summary>\n\n```text\n{output}\n```\n\n</details>\n")
+
+          # The report job posts failures as a PR comment
+          if report:
+              reports = Path("shared/reports")
+              reports.mkdir(parents=True, exist_ok=True)
+              (reports / f"{os.environ['JOB_INDEX']}.md").write_text("\n".join(report))
+              sys.exit(1)
+        env:
+          CHART: ${{ matrix.chart }}
+          STRICT: ${{ inputs.strict }}
+          JOB_INDEX: ${{ strategy.job-index }}
+
+      - name: upload artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f #v7.0.0
+        with:
+          name: "k8s-manifests-${{ strategy.job-index }}"
+          path: "shared"
+
+  report:
+    runs-on: ubuntu-latest
+    needs: render_and_validate
+    if: ${{ !cancelled() && needs.render_and_validate.result != 'skipped' }}
+    steps:
       - name: download artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 #v8.0.0
         with:
@@ -141,166 +176,39 @@ jobs:
           merge-multiple: true
           path: "shared"
 
-      - name: validate k8s manifests
-        id: validate_k8s_manifests
-        env:
-          STRICT: ${{ inputs.strict }}
-          CHARTS: ${{ needs.get_changed_helm_charts.outputs.charts }}
-        run: |
-          set -euo pipefail
-
-          # Optional strict flag
-          STRICT_FLAG=""
-          if [ "${STRICT}" = "true" ]; then
-            STRICT_FLAG="-strict"
-          fi
-          # To support multi-chart tenants we need to normalize the kubeconform output
-          # We are populating it with the standard kubeconform structure, but will append to these values during subsequent runs
-          echo '{"summary":{"valid":0,"invalid":0,"errors":0,"skipped":0},"resources":[]}' > kubeconform.json
-          exit_code=0
-
-          for chart in $CHARTS; do
-            echo "Validating ${chart}..."
-
-            if [ -d "shared/charts/${chart}" ]; then
-              tmp_output=$(mktemp)
-
-              # Always run kubeconform and capture output, even if it fails
-              /usr/local/bin/kubeconform \
-                ${STRICT_FLAG} \
-                -schema-location default \
-                -schema-location "${KUBECONFORM_SCHEMA_LOCATION}" \
-                -schema-location "${KUBECONFORM_CUSTOM_SCHEMA_LOCATION}" \
-                -summary \
-                -skip CustomResourceDefinition \
-                -output json \
-                "shared/charts/${chart}" > "$tmp_output" 2>&1 || exit_code=1
-
-              # Merge output only if it's valid JSON
-              if jq empty "$tmp_output" >/dev/null 2>&1; then
-                jq --arg chartDir "shared/charts/${chart}/" \
-                   --slurpfile base kubeconform.json \
-                   '
-                   {
-                     summary: {
-                       valid: ($base[0].summary.valid + .summary.valid),
-                       invalid: ($base[0].summary.invalid + .summary.invalid),
-                       errors: ($base[0].summary.errors + .summary.errors),
-                       skipped: ($base[0].summary.skipped + .summary.skipped)
-                     },
-                     resources: ($base[0].resources + (.resources | map(.filename |= sub("^" + $chartDir; ""))))
-                   }
-                   ' "$tmp_output" > kubeconform.tmp && mv kubeconform.tmp kubeconform.json
-              else
-                echo "Warning: kubeconform output for ${chart} is not valid JSON:"
-                cat "$tmp_output"
-                exit_code=1
-              fi
-            else
-              echo "Warning: Rendered output for ${chart} not found."
-            fi
-          done
-
-          echo "kubeconform_exit_code=$exit_code" >> $GITHUB_OUTPUT
-
-      - name: minimize previous kubeconform comments
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        with:
-          script: |
-            const marker = "<!-- kubeconform-marker -->";
-
-            const { data: comments } = await github.rest.issues.listComments({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo
-            });
-
-            for (const comment of comments) {
-              if (
-                comment.body.includes(marker) &&
-                comment.user.type === "Bot"
-              ) {
-                await github.graphql(`
-                  mutation MinimizeComment($subjectId: ID!) {
-                    minimizeComment(input: {
-                      subjectId: $subjectId,
-                      classifier: OUTDATED
-                    }) {
-                      minimizedComment {
-                        isMinimized
-                      }
-                    }
-                  }
-                `, {
-                  subjectId: comment.node_id
-                });
-              }
-            }
-
-      - name: post kubeconform comment
-        if: steps.validate_k8s_manifests.outputs.kubeconform_exit_code != '0'
+      - name: comment kubeconform failures on pull request
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const fs = require('fs');
 
-            const json = JSON.parse(fs.readFileSync('kubeconform.json', 'utf8'));
-
             const marker = '<!-- kubeconform-marker -->';
             const commentCharLimit = 65536;
+            const issue = { issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo };
 
-            // Format the summary line
-            const { valid, invalid, errors, skipped } = json.summary;
-            const summaryLine = `Kubernetes Manifest Validation: ${valid + invalid + errors + skipped} resources found - Valid: ${valid}, Invalid: ${invalid}, Errors: ${errors}, Skipped: ${skipped}`;
-
-            const errorDetails = json.resources.map(r => {
-              return `${r.filename} - ${r.kind} ${r.name} failed validation: ${r.msg}`;
-            }).join('\n');
-
-            const sepEnd = "\n```\n</details>\n\nNote: Continued in next comment.";
-            const sepStart = "Continued from previous comment:\n<details><summary>Show full output</summary>\n\n```text\n";
-            const comStart = `${summaryLine}\n\n<details><summary>Show full output</summary>\n\n\`\`\`text\n`;
-
-            function splitComment(content, maxSize, sepEnd, sepStart, comStart) {
-              // Adapted from Atlantis SplitComment function
-              // https://github.com/runatlantis/atlantis/blob/main/server/events/vcs/common/common.go#L18
-              if (content.length <= (maxSize - comStart.length)) {
-                return [`${comStart}${content}\n\`\`\`\n</details>\n${marker}`];
+            // Minimize comments from previous runs
+            const { data: comments } = await github.rest.issues.listComments(issue);
+            for (const comment of comments) {
+              if (comment.body.includes(marker) && comment.user.type === 'Bot') {
+                await github.graphql(`
+                  mutation MinimizeComment($subjectId: ID!) {
+                    minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
+                      minimizedComment { isMinimized }
+                    }
+                  }
+                `, { subjectId: comment.node_id });
               }
-
-              const maxWithSep = maxSize - sepEnd.length - sepStart.length;
-              const numComments = Math.ceil(content.length / maxWithSep);
-              const comments = [];
-
-              for (let i = 0; i < numComments; i++) {
-                const start = i * maxWithSep;
-                const end = Math.min(content.length, (i + 1) * maxWithSep);
-                let chunk = content.slice(start, end);
-
-                if (i < numComments - 1) chunk += sepEnd;
-                if (i > 0) chunk = sepStart + chunk;
-                else chunk = comStart + chunk;
-
-                comments.push(`${chunk}\n\`\`\`\n</details>\n${marker}`);
-              }
-
-              return comments;
             }
 
-            const comments = splitComment(errorDetails, commentCharLimit, sepEnd, sepStart, comStart);
+            const reportsDir = 'shared/reports';
+            if (!fs.existsSync(reportsDir)) return;
+            const reports = fs.readdirSync(reportsDir).sort().map(f => fs.readFileSync(`${reportsDir}/${f}`, 'utf8'));
 
-            for (const body of comments) {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body
-              });
+            const output = `Kubernetes manifest validation failed:\n\n${reports.join('\n')}`;
+            let body = `${output}\n${marker}`;
+            if (body.length > commentCharLimit) {
+              await core.summary.addRaw(output).write();
+              const summaryUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+              body = `Kubernetes manifest validation failed. The output is too long for a comment, see the [workflow run summary](${summaryUrl}).\n${marker}`;
             }
-
-      - name: fail workflow if kubeconform validation fails
-        run: |
-          # We want this workflow to fail if kubeconform validation fails, but after posting the comment
-          exit ${EXIT_CODE}
-        env:
-          EXIT_CODE: ${{ steps.validate_k8s_manifests.outputs.kubeconform_exit_code }}
+            await github.rest.issues.createComment({ ...issue, body });

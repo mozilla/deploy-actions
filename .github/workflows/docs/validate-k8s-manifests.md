@@ -12,6 +12,18 @@ Renders Helm charts and validates the resulting Kubernetes manifests using [kube
 
 When `strict: true`, kubeconform will reject resources with unknown fields and enforce stricter schema validation.
 
+## How Charts Are Found and Rendered
+
+A chart is any `<dir>/k8s/<chart>/` directory containing a `Chart.yaml` with at least one changed file (templates, values, `Chart.lock`, `.helmignore`, files loaded with `.Files.Get`, etc.). Changed paths under `k8s/` without a `Chart.yaml`, such as values-only directories for upstream charts, raw manifests, or deleted charts, are skipped with a notice.
+
+Every top-level YAML file in the chart directory, other than `Chart.yaml`, `values.yaml` and dotfiles, is a values file for one deployment. The chart is rendered once per values file, layered on top of `values.yaml` and on any values file whose name is a prefix of its own:
+
+- `values-prod.yaml` renders with `values.yaml` + `values-prod.yaml`
+- `values-prod-us-west1.yaml` renders with `values.yaml` + `values-prod.yaml` + `values-prod-us-west1.yaml`
+- A chart with no other values files is rendered with `values.yaml` alone
+
+Each render is validated with kubeconform. Any error from `helm dependency update` or `helm template`, or any invalid manifest, fails the workflow.
+
 ## Usage
 
 ### Basic validation
@@ -67,14 +79,20 @@ jobs:
 
 ## Example Output
 
-When validation fails, a comment is posted to the PR:
+When validation fails, kubeconform's output is posted to the PR as a comment, with a collapsible section for each failing render. If it is too long for a single comment, it is written to the workflow run summary instead, and the comment links to it.
+
+````markdown
+Kubernetes manifest validation failed:
+
+<details><summary>apps/k8s/my-service (values-prod)</summary>
 
 ```text
-Kubernetes Manifest Validation: 2 resources found - Valid: 0, Invalid: 2, Errors: 0, Skipped: 0
-
-apps/my-service/k8s/values-prod/my-service/templates/deployment.yaml - Deployment my-service failed validation: missing required field "selector" in io.k8s.api.apps.v1.Deployment
-apps/my-service/k8s/values-prod/my-service/templates/service.yaml - Service my-service failed validation: Invalid value: "LoadBalancerr": spec.type
+my-service/templates/deployment.yaml - Deployment my-service is invalid: problem validating schema. Check JSON formatting: jsonschema validation failed with 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/master-standalone-strict/deployment-apps-v1.json#' - at '/spec/template/spec/containers/0/securityContext': additional properties 'fsGroupChangePolicy' not allowed
+Summary: 12 resources found in 8 files - Valid: 11, Invalid: 1, Errors: 0, Skipped: 0
 ```
+
+</details>
+````
 
 ## Artifacts
 
