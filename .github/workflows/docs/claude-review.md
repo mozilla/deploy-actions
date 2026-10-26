@@ -196,10 +196,13 @@ jobs:
 In skill mode Claude is told to take the review-only path wherever the skill would ask a question
 or offer to post, and to report missing optional sources (Confluence, internal sites) instead of
 stopping. The skill's own summary is rendered in the comment via `summary_markdown`; its flags
-become findings. Only the requested skill may be invoked. Before loading, the plugin's hooks,
-`.mcp.json` and every skill's `allowed-tools` frontmatter are removed (a skill's allow list would
-otherwise widen Claude's permissions even in a non-interactive run), hooks are disabled through
-settings, and network and GitHub-mutating commands are denied regardless of what a skill asks for.
+become findings. Only the requested skill may be invoked, by its bare name or its plugin-prefixed
+name (`workgroups` or `mozcloud-tools:workgroups`); the skill must come from the plugin, since the
+checkout's own `.claude/`, `CLAUDE.md` and `AGENTS.md` are removed and memory files are not loaded.
+Before loading, the plugin's hooks, `.mcp.json` and every skill's `allowed-tools` frontmatter are
+removed (a skill's allow list would otherwise widen Claude's permissions even in a non-interactive
+run), hooks are disabled through settings, and network and GitHub-mutating commands are denied
+regardless of what a skill asks for.
 
 The `plugin` job's `if:` must mirror the shared gate's trigger filter; it exists only because a
 reusable workflow cannot take a `uses:` reference as an input.

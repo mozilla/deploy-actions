@@ -62,8 +62,9 @@ inputs:
   skill:
     description: >-
       Run a Claude Code skill instead of the built-in plan/Helm review, e.g.
-      "/workgroups review {pr}". "{pr}" is replaced with the PR number. The skill must come from
-      the checked-out repository or from `plugin_dirs`.
+      "/workgroups review {pr}". "{pr}" is replaced with the PR number. The skill must come from a
+      plugin passed via `plugin_dirs`; the checkout's own `.claude/` is removed before Claude runs.
+      Name it bare ("workgroups") or with its plugin prefix ("mozcloud-tools:workgroups").
     required: false
     default: ""
   plugin_dirs:
@@ -241,13 +242,17 @@ runs:
         ls -la "$CTX"
 
     # Repo-level agent configuration from the PR branch could add hooks or MCP servers that run
-    # with the API key in the environment. The prompt here is the only instruction source.
+    # with the API key in the environment, and CLAUDE.md/AGENTS.md files would be loaded as
+    # instructions. The prompt here is the only instruction source (memory loading is also
+    # disabled via CLAUDE_CODE_DISABLE_CLAUDE_MDS on the run step).
     - name: Remove agent configuration from the checkout
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
-        rm -rf .claude .mcp.json
-        find . -maxdepth 3 -name .mcp.json -exec rm -f {} + 2>/dev/null || true
+        rm -rf .claude .mcp.json CLAUDE.md CLAUDE.local.md AGENTS.md
+        find . -maxdepth 3 -not -path './.git/*' \
+          \( -name .mcp.json -o -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md \) \
+          -exec rm -f {} + 2>/dev/null || true
 
     # Plugins supply skills only. Hooks are arbitrary code that would run with the job token,
     # MCP servers need binaries the runner does not have, and a skill's own `allowed-tools`
@@ -261,6 +266,7 @@ runs:
       run: |
         set -euo pipefail
         ARGS=""
+        NAMES=""
         while read -r DIR; do
           [[ -z "$DIR" ]] && continue
           # A plugin handed over as a tarball (preserves file modes) is unpacked in place.
@@ -277,21 +283,39 @@ runs:
           rm -rf "$DIR/hooks" "$DIR/.mcp.json"
           jq 'del(.hooks, .mcpServers)' "$DIR/.claude-plugin/plugin.json" > "$DIR/.claude-plugin/plugin.tmp" \
             && mv "$DIR/.claude-plugin/plugin.tmp" "$DIR/.claude-plugin/plugin.json"
-          # Drop `allowed-tools:` (scalar or list) and `hooks:` from skill and agent frontmatter.
+          # Drop `allowed-tools:` (scalar or list, blank lines included) and `hooks:` from skill,
+          # command and agent frontmatter. CRLF line endings are normalised so "---" matches.
+          MD_DIRS=("$DIR/skills" "$DIR/commands" "$DIR/agents")
           while IFS= read -r -d '' MD; do
             awk '
+              { sub(/\r$/, "") }
               NR == 1 && $0 == "---" { fm = 1; print; next }
-              fm && $0 == "---"        { fm = 0; print; next }
+              fm && $0 == "---"        { fm = 0; skip = 0; print; next }
               fm && /^(allowed-tools|hooks):/ { skip = 1; next }
-              fm && skip && /^[[:space:]]+/   { next }
-              fm && skip && /^-/              { next }
+              fm && skip && (/^[[:space:]]/ || /^-/ || /^$/) { next }
               { skip = 0; print }
             ' "$MD" > "$MD.tmp" && mv "$MD.tmp" "$MD"
-          done < <(find "$DIR/skills" "$DIR/agents" -name '*.md' -print0 2>/dev/null)
-          echo "Loading plugin $(jq -r .name "$DIR/.claude-plugin/plugin.json") from $DIR"
+          done < <(find "${MD_DIRS[@]}" -name '*.md' -print0 2>/dev/null)
+          # Fail closed if any frontmatter still carries either key.
+          LEFT=$(find "${MD_DIRS[@]}" -name '*.md' -print0 2>/dev/null | xargs -0 -r awk '
+              FNR == 1 { fm = ($0 == "---") ; next }
+              fm && $0 == "---" { fm = 0 }
+              fm && /^(allowed-tools|hooks):/ { print FILENAME }')
+          if [[ -n "$LEFT" ]]; then
+            echo "::error::allowed-tools/hooks still present in frontmatter:"; echo "$LEFT"
+            exit 1
+          fi
+          NAME=$(jq -r '.name // empty' "$DIR/.claude-plugin/plugin.json")
+          if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::Plugin at '$DIR' has no valid name in plugin.json."
+            exit 1
+          fi
+          echo "Loading plugin $NAME from $DIR"
           ARGS+=" --plugin-dir \"$DIR\""
+          NAMES+=" $NAME"
         done <<< "$PLUGIN_DIRS"
         echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+        echo "names=${NAMES# }" >> "$GITHUB_OUTPUT"
 
     - name: Build tool allow list
       id: tools
@@ -299,17 +323,25 @@ runs:
       env:
         EXTRA: ${{ inputs.extra_allowed_tools }}
         SKILL: ${{ inputs.skill }}
+        PLUGINS: ${{ steps.plugins.outputs.names }}
       run: |
         set -euo pipefail
         ARGS=""
         if [[ -n "$SKILL" ]]; then
           # "/workgroups review {pr}" -> only that skill may be invoked, with any arguments.
+          # Skill rules take "Skill(name)" and "Skill(name *)". Plugin skills are registered as
+          # "<plugin>:<name>", so the namespaced forms are allowed as well when a bare name is given.
           NAME=$(printf '%s' "$SKILL" | sed -E 's#^/##; s/[[:space:]].*$//')
-          if [[ ! "$NAME" =~ ^[A-Za-z0-9_:-]+$ ]]; then
+          if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+(:[A-Za-z0-9_-]+)?$ ]]; then
             echo "::error::Cannot derive a skill name from '$SKILL'."
             exit 1
           fi
-          ARGS+=" \"Skill($NAME)\" \"Skill($NAME:*)\""
+          ARGS+=" \"Skill($NAME)\" \"Skill($NAME *)\""
+          if [[ "$NAME" != *:* ]]; then
+            for PLUGIN in $PLUGINS; do
+              ARGS+=" \"Skill($PLUGIN:$NAME)\" \"Skill($PLUGIN:$NAME *)\""
+            done
+          fi
         fi
         while read -r RULE; do
           [[ -z "$RULE" ]] && continue
@@ -382,6 +414,7 @@ runs:
       uses: anthropics/claude-code-action@v1 # zizmor: ignore[unpinned-uses]
       env:
         CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" # Keeps secrets out of Claude's shell commands.
+        CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1" # No CLAUDE.md/AGENTS.md from the PR branch as instructions.
       with:
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
         # An explicit token stops the action from minting a Claude App OIDC token (needs id-token: write).
