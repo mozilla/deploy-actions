@@ -63,12 +63,10 @@ the caller before the secret exists without PR noise.
 | `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
 | `skill` | string | `""` | Skill mode: run a Claude Code skill such as `/workgroups review {pr}` instead of the plan/Helm review. `{pr}` is replaced with the PR number |
-| `plugin_repository` / `plugin_ref` / `plugin_path` | string | `""` / `main` / `""` | Plugin to load for skill mode: `owner/repo`, ref, and the directory holding `.claude-plugin/plugin.json`. Hooks and MCP servers in the plugin are not loaded |
-| `plugin_repo_app_id` | string | `""` | With the `PLUGIN_REPO_APP_KEY` secret, mints a `contents: read` token for an internal plugin repository |
+| `plugin_artifact` | string | `""` | Artifact in this run holding a Claude Code plugin directory, uploaded by a caller job (see skill mode below). Hooks and MCP servers in the plugin are not loaded |
 | `extra_allowed_tools` | string | `""` | Permission rules added in skill mode, one per line (`Bash(git log:*)`, `WebFetch(domain:example.com)`). Write, Edit and AskUserQuestion stay denied |
 
-Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only),
-`PLUGIN_REPO_TOKEN` or `PLUGIN_REPO_APP_KEY` (optional, skill mode with an internal plugin repo).
+Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only).
 
 ## Permissions
 
@@ -142,9 +140,12 @@ jobs:
 ### Skill mode: run a plugin skill on matching PRs
 
 Runs the mozcloud-tools `workgroups` skill whenever Atlantis plans a PR that changes a workgroup
-file, and on `@claude`. The plugin repository is internal, so a GitHub App installed on it mints
-the read token. A second caller on the same repository needs its own `comment_marker`, and the
-generic caller should `paths_ignore` the same files so the PR gets one review, not two.
+file, and on `@claude`. The plugin lives in `mozilla/mozcloud`, an internal repository the
+default token cannot check out, but whose Actions access setting lets other Mozilla repositories
+run its actions. A short caller job runs `mozilla/mozcloud/claude/actions/plugin`, which uploads
+the plugin directory as an artifact; no token changes hands. A second caller on the same
+repository needs its own `comment_marker`, and the generic caller should `paths_ignore` the same
+files so the PR gets one review, not two.
 
 ```yaml
 # .github/workflows/workgroup-review.yaml
@@ -152,7 +153,23 @@ on:
   issue_comment:
     types: [created]
 jobs:
+  plugin:
+    # Same cheap pre-filter as the shared gate, so unrelated comments start no runner.
+    if: >-
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '@claude') ||
+       startsWith(github.event.comment.body, 'Ran Plan'))
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      artifact: ${{ steps.plugin.outputs.artifact }}
+    steps:
+      - id: plugin
+        uses: mozilla/mozcloud/claude/actions/plugin@<sha>
+        with:
+          plugin: mozcloud-tools
   workgroup-review:
+    needs: plugin
     uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v7
     permissions:
       contents: read
@@ -163,15 +180,12 @@ jobs:
       paths: |
         google-workspace-management/tf/workgroups/*.yaml
       skill: "/workgroups review {pr}"
-      plugin_repository: mozilla/mozcloud
-      plugin_path: claude/plugins/mozcloud-tools
-      plugin_repo_app_id: ${{ vars.AUTOMERGE_APP_ID }}
+      plugin_artifact: ${{ needs.plugin.outputs.artifact }}
       extra_allowed_tools: |
         Bash(git log:*)
         WebFetch(domain:protosaur.dev)
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      PLUGIN_REPO_APP_KEY: ${{ secrets.DEPENDABOT_AUTOMERGE_KEY }}
 ```
 
 In skill mode Claude is told to take the review-only path wherever the skill would ask a question

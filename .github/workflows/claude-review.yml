@@ -88,23 +88,11 @@ on:
           "/workgroups review {pr}". Pair with the plugin_* inputs when the skill lives in a plugin.
         type: string
         default: ""
-      plugin_repository:
+      plugin_artifact:
         description: >-
-          owner/repo of a Claude Code plugin to load for skill mode (e.g. mozilla/mozcloud). Read
-          with PLUGIN_REPO_TOKEN, a token minted from plugin_repo_app_id + PLUGIN_REPO_APP_KEY, or
-          the default token for public repositories.
-        type: string
-        default: ""
-      plugin_ref:
-        description: Git ref of plugin_repository to check out.
-        type: string
-        default: main
-      plugin_path:
-        description: Path of the plugin inside plugin_repository (directory holding .claude-plugin/plugin.json).
-        type: string
-        default: ""
-      plugin_repo_app_id:
-        description: GitHub App ID used with PLUGIN_REPO_APP_KEY to mint a contents:read token for plugin_repository.
+          Name of an artifact in this workflow run containing a Claude Code plugin (a directory with
+          .claude-plugin/plugin.json at its root) to load in skill mode. Produce it in a caller job
+          with an action from the plugin's repository, e.g. mozilla/mozcloud/claude/actions/plugin.
         type: string
         default: ""
       extra_allowed_tools:
@@ -117,12 +105,6 @@ on:
         required: true
       SLACK_WEBHOOK_URL:
         description: Optional incoming webhook; the scheduled health check posts there when reviews are failing.
-        required: false
-      PLUGIN_REPO_TOKEN:
-        description: Optional token with contents:read on plugin_repository.
-        required: false
-      PLUGIN_REPO_APP_KEY:
-        description: Optional GitHub App private key, used with plugin_repo_app_id.
         required: false
 
 jobs:
@@ -291,44 +273,17 @@ jobs:
           fetch-depth: ${{ inputs.skill != '' && '0' || '1' }}
           persist-credentials: false
 
-      # Optional plugin for skill mode. The plugin repository is usually internal, so a token
-      # with read access is minted from a GitHub App or passed in; the default token only works
-      # for public repositories. Only `plugin_path` is checked out.
-      - name: Mint plugin repository token
-        id: plugin_token
-        if: ${{ inputs.plugin_repository != '' && inputs.plugin_repo_app_id != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.plugin_repo_app_id }}
-          private-key: ${{ secrets.PLUGIN_REPO_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ inputs.plugin_repository }}
-          permission-contents: read
-
-      - name: Checkout plugin repository
-        if: ${{ inputs.plugin_repository != '' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-        with:
-          repository: ${{ inputs.plugin_repository }}
-          ref: ${{ inputs.plugin_ref }}
-          token: ${{ steps.plugin_token.outputs.token || secrets.PLUGIN_REPO_TOKEN || github.token }}
-          path: .claude-plugin-checkout
-          sparse-checkout: ${{ inputs.plugin_path }}
-          persist-credentials: false
-
-      - name: Move plugin out of the workspace
+      # Optional plugin for skill mode, handed over as an artifact by a caller job. Plugins usually
+      # live in internal repositories the default token cannot read; an action in that repository
+      # (allowed through its "Actions access" setting) can still be run from the caller and upload
+      # the plugin directory. No token changes hands.
+      - name: Download plugin artifact
         id: plugin
-        if: ${{ inputs.plugin_repository != '' }}
-        env:
-          PLUGIN_PATH: ${{ inputs.plugin_path }}
-          DEST: ${{ runner.temp }}/claude-plugins
-        run: |
-          set -euo pipefail
-          mkdir -p "$DEST"
-          NAME=$(basename "$PLUGIN_PATH")
-          mv ".claude-plugin-checkout/$PLUGIN_PATH" "$DEST/$NAME"
-          rm -rf .claude-plugin-checkout
-          echo "dir=$DEST/$NAME" >> "$GITHUB_OUTPUT"
+        if: ${{ inputs.plugin_artifact != '' }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 #v8.0.0
+        with:
+          name: ${{ inputs.plugin_artifact }}
+          path: ${{ runner.temp }}/claude-plugins/plugin
 
       # "$/" resolves to this workflow's own repository at the running commit, so the composite
       # action and its prompt always match this file. Needs runner 2.336.0+ (github.com has it).
@@ -348,7 +303,7 @@ jobs:
           budget: ${{ inputs.budget_usd }}
           debounce_seconds: ${{ inputs.debounce_seconds }}
           skill: ${{ inputs.skill }}
-          plugin_dirs: ${{ steps.plugin.outputs.dir }}
+          plugin_dirs: ${{ inputs.plugin_artifact != '' && format('{0}/claude-plugins/plugin', runner.temp) || '' }}
           extra_allowed_tools: ${{ inputs.extra_allowed_tools }}
           comment_marker: ${{ inputs.comment_marker }}
 
