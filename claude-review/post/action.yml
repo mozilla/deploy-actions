@@ -27,6 +27,10 @@ inputs:
     description: Fallback PR number when `review` is empty (so a failure can still be reported on the PR).
     required: false
     default: ""
+  comment_marker:
+    description: Marker identifier used by claude-review; earlier comments carrying `<!-- <marker> -->` are minimized.
+    required: false
+    default: claude-review
 
 runs:
   using: composite
@@ -40,10 +44,11 @@ runs:
         POST_STATUS: ${{ inputs.post_status }}
         STATUS_CONTEXT: ${{ inputs.status_context }}
         FALLBACK_PR: ${{ inputs.pr_number }}
+        MARKER_ID: ${{ inputs.comment_marker }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         set -euo pipefail
-        MARKER="<!-- claude-review -->"
+        MARKER="<!-- ${MARKER_ID} -->"
 
         if [[ -z "$REVIEW" ]]; then
           if [[ -z "$FALLBACK_PR" ]]; then
@@ -51,9 +56,9 @@ runs:
             exit 1
           fi
           # The review job died before producing output. Say so instead of staying silent.
-          REVIEW=$(jq -cn --arg pr "$FALLBACK_PR" --arg run "$RUN_URL" '{
+          REVIEW=$(jq -cn --arg pr "$FALLBACK_PR" --arg run "$RUN_URL" --arg marker "$MARKER" '{
             pr_number: $pr, head_sha: "", state: "failure", description: "Review job failed",
-            body: ("<!-- claude-review -->\n### Claude review: not produced\n\n> [!WARNING]\n> The review job failed before returning a result. See the [run log](" + $run + ")."),
+            body: ($marker + "\n### Claude review: not produced\n\n> [!WARNING]\n> The review job failed before returning a result. See the [run log](" + $run + ")."),
             error: "Claude review job produced no output."}')
         fi
         if ! jq -e '.pr_number and .body' <<< "$REVIEW" > /dev/null; then
