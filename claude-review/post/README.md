@@ -8,13 +8,14 @@ Posts the review produced by claude-review as one PR comment (minimizing earlier
 ## Inputs
 
 <!--inputs-->
-| Name             | Description                                                                                   | Required | Default               |
-|------------------|-----------------------------------------------------------------------------------------------|----------|-----------------------|
-| `review`         | The `review` output of claude-review. Empty means the review job produced nothing.            | `true`   | ` `                   |
-| `github_token`   | GitHub token with pull-requests:write (and statuses:write when post_status is true).          | `false`  | `${{ github.token }}` |
-| `post_status`    | Also publish a commit status on the PR head. success = a review was produced, failure = none. | `false`  | `false`               |
-| `status_context` | Commit status context name.                                                                   | `false`  | `claude-review`       |
-| `pr_number`      | Fallback PR number when `review` is empty (so a failure can still be reported on the PR).     | `false`  | ` `                   |
+| Name             | Description                                                                                           | Required | Default               |
+|------------------|-------------------------------------------------------------------------------------------------------|----------|-----------------------|
+| `review`         | The `review` output of claude-review. Empty means the review job produced nothing.                    | `true`   | ` `                   |
+| `github_token`   | GitHub token with pull-requests:write (and statuses:write when post_status is true).                  | `false`  | `${{ github.token }}` |
+| `post_status`    | Also publish a commit status on the PR head. success = a review was produced, failure = none.         | `false`  | `false`               |
+| `status_context` | Commit status context name.                                                                           | `false`  | `claude-review`       |
+| `pr_number`      | Fallback PR number when `review` is empty (so a failure can still be reported on the PR).             | `false`  | ` `                   |
+| `comment_marker` | Marker identifier used by claude-review; earlier comments carrying `<!-- <marker> -->` are minimized. | `false`  | `claude-review`       |
 <!--/inputs-->
 
 ## Behaviour

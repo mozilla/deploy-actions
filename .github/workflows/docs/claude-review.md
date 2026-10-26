@@ -60,8 +60,15 @@ the caller before the secret exists without PR noise.
 | `debounce_seconds` | string | `45` | Wait after a plan comment so continuation comments and sibling stacks land first |
 | `post_status` | boolean | `false` | Publish a `claude-review` commit status (caller needs `statuses: write`) |
 | `pr_number` | string | `""` | Explicit PR number for `workflow_dispatch` callers |
+| `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match |
+| `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
+| `skill` | string | `""` | Skill mode: run a Claude Code skill such as `/workgroups review {pr}` instead of the plan/Helm review. `{pr}` is replaced with the PR number |
+| `plugin_repository` / `plugin_ref` / `plugin_path` | string | `""` / `main` / `""` | Plugin to load for skill mode: `owner/repo`, ref, and the directory holding `.claude-plugin/plugin.json`. Hooks and MCP servers in the plugin are not loaded |
+| `plugin_repo_app_id` | string | `""` | With the `PLUGIN_REPO_APP_KEY` secret, mints a `contents: read` token for an internal plugin repository |
+| `extra_allowed_tools` | string | `""` | Permission rules added in skill mode, one per line (`Bash(git log:*)`, `WebFetch(domain:example.com)`). Write, Edit and AskUserQuestion stay denied |
 
-Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only).
+Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only),
+`PLUGIN_REPO_TOKEN` or `PLUGIN_REPO_APP_KEY` (optional, skill mode with an internal plugin repo).
 
 ## Permissions
 
@@ -131,6 +138,47 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
+
+### Skill mode: run a plugin skill on matching PRs
+
+Runs the mozcloud-tools `workgroups` skill whenever Atlantis plans a PR that changes a workgroup
+file, and on `@claude`. The plugin repository is internal, so a GitHub App installed on it mints
+the read token. A second caller on the same repository needs its own `comment_marker`, and the
+generic caller should `paths_ignore` the same files so the PR gets one review, not two.
+
+```yaml
+# .github/workflows/workgroup-review.yaml
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  workgroup-review:
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v7
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      comment_marker: claude-review-workgroups
+      atlantis_bot: ${{ vars.ATLANTIS_GITHUB_USER }}
+      paths: |
+        google-workspace-management/tf/workgroups/*.yaml
+      skill: "/workgroups review {pr}"
+      plugin_repository: mozilla/mozcloud
+      plugin_path: claude/plugins/mozcloud-tools
+      plugin_repo_app_id: ${{ vars.AUTOMERGE_APP_ID }}
+      extra_allowed_tools: |
+        Bash(git log:*)
+        WebFetch(domain:protosaur.dev)
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PLUGIN_REPO_APP_KEY: ${{ secrets.DEPENDABOT_AUTOMERGE_KEY }}
+```
+
+In skill mode Claude is told to take the review-only path wherever the skill would ask a question
+or offer to post, and to report missing optional sources (Confluence, internal sites) instead of
+stopping. The skill's own summary is rendered in the comment via `summary_markdown`; its flags
+become findings. Plugin hooks and `.mcp.json` are stripped before loading, since hook scripts
+would run with the API key in the environment.
 
 ### Using the composite actions directly
 

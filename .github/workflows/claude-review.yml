@@ -64,12 +64,65 @@ on:
         description: Explicit PR number (for workflow_dispatch callers). Otherwise taken from the event.
         type: string
         default: ""
+      paths:
+        description: >-
+          Newline-separated path globs. When set, only PRs that change at least one matching file
+          are reviewed (applies to every trigger, including plan comments).
+        type: string
+        default: ""
+      paths_ignore:
+        description: >-
+          Newline-separated path globs. PRs whose changed files all match are not reviewed. Use it
+          to hand a class of PRs to a dedicated caller (e.g. workgroup files to a skill review).
+        type: string
+        default: ""
+      comment_marker:
+        description: >-
+          Identifier for this review's comments and concurrency group. Each caller on a repository
+          needs its own marker so reviews do not collapse or cancel each other.
+        type: string
+        default: claude-review
+      skill:
+        description: >-
+          Run a Claude Code skill instead of the built-in plan/Helm review, e.g.
+          "/workgroups review {pr}". Pair with the plugin_* inputs when the skill lives in a plugin.
+        type: string
+        default: ""
+      plugin_repository:
+        description: >-
+          owner/repo of a Claude Code plugin to load for skill mode (e.g. mozilla/mozcloud). Read
+          with PLUGIN_REPO_TOKEN, a token minted from plugin_repo_app_id + PLUGIN_REPO_APP_KEY, or
+          the default token for public repositories.
+        type: string
+        default: ""
+      plugin_ref:
+        description: Git ref of plugin_repository to check out.
+        type: string
+        default: main
+      plugin_path:
+        description: Path of the plugin inside plugin_repository (directory holding .claude-plugin/plugin.json).
+        type: string
+        default: ""
+      plugin_repo_app_id:
+        description: GitHub App ID used with PLUGIN_REPO_APP_KEY to mint a contents:read token for plugin_repository.
+        type: string
+        default: ""
+      extra_allowed_tools:
+        description: Newline-separated permission rules added to Claude's allow list in skill mode (e.g. "Bash(git log:*)").
+        type: string
+        default: ""
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key.
         required: true
       SLACK_WEBHOOK_URL:
         description: Optional incoming webhook; the scheduled health check posts there when reviews are failing.
+        required: false
+      PLUGIN_REPO_TOKEN:
+        description: Optional token with contents:read on plugin_repository.
+        required: false
+      PLUGIN_REPO_APP_KEY:
+        description: Optional GitHub App private key, used with plugin_repo_app_id.
         required: false
 
 jobs:
@@ -115,6 +168,9 @@ jobs:
           SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
           HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
           HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          PATHS: ${{ inputs.paths }}
+          PATHS_IGNORE: ${{ inputs.paths_ignore }}
+          MARKER: ${{ inputs.comment_marker }}
         run: |
           set -euo pipefail
           skip() { echo "::notice::Not reviewing: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -159,7 +215,7 @@ jobs:
             if [[ "$TRIGGER" == "on-demand" ]]; then
               # A human asked; answer so the request does not vanish.
               gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
-                -f body="<!-- claude-review -->
+                -f body="<!-- $MARKER -->
           ### Claude review: not run
 
           This pull request is **$STATE**; there is nothing current to review." > /dev/null
@@ -168,6 +224,37 @@ jobs:
           fi
           if [[ "$DRAFT" == "true" && "$TRIGGER" == "pull-request" ]]; then
             skip "PR #$PR_NUMBER is a draft."
+          fi
+
+          # Path filters apply to every trigger, since issue_comment events carry no paths.
+          if [[ -n "$PATHS" || -n "$PATHS_IGNORE" ]]; then
+            mapfile -t FILES < <(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename')
+            matches_any() {  # $1 = newline-separated globs; true if any changed file matches any glob
+              local f g
+              while read -r g; do
+                [[ -z "$g" ]] && continue
+                for f in "${FILES[@]}"; do [[ "$f" == $g ]] && return 0; done
+              done <<< "$1"
+              return 1
+            }
+            all_match() {  # $1 = globs; true if every changed file matches some glob
+              local f g ok
+              for f in "${FILES[@]}"; do
+                ok=false
+                while read -r g; do
+                  [[ -z "$g" ]] && continue
+                  [[ "$f" == $g ]] && { ok=true; break; }
+                done <<< "$1"
+                [[ "$ok" == true ]] || return 1
+              done
+              return 0
+            }
+            if [[ -n "$PATHS" ]] && ! matches_any "$PATHS"; then
+              skip "PR #$PR_NUMBER changes no file matching 'paths'."
+            fi
+            if [[ -n "$PATHS_IGNORE" && ${#FILES[@]} -gt 0 ]] && all_match "$PATHS_IGNORE"; then
+              skip "every changed file in PR #$PR_NUMBER matches 'paths_ignore'."
+            fi
           fi
 
           {
@@ -187,7 +274,7 @@ jobs:
     # One review per PR at a time; a newer plan comment or request supersedes a running review.
     # Only review triggers reach this job, so unrelated comments cannot cancel it.
     concurrency:
-      group: claude-review-${{ github.repository }}-${{ needs.gate.outputs.pr_number }}
+      group: ${{ inputs.comment_marker }}-${{ github.repository }}-${{ needs.gate.outputs.pr_number }}
       cancel-in-progress: true
     # Read-only: a token Claude could read is worth little.
     permissions:
@@ -200,8 +287,48 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           ref: ${{ needs.gate.outputs.head_sha }}
-          fetch-depth: 1
+          # Skills tend to read file history (`git log`); the plan review does not.
+          fetch-depth: ${{ inputs.skill != '' && '0' || '1' }}
           persist-credentials: false
+
+      # Optional plugin for skill mode. The plugin repository is usually internal, so a token
+      # with read access is minted from a GitHub App or passed in; the default token only works
+      # for public repositories. Only `plugin_path` is checked out.
+      - name: Mint plugin repository token
+        id: plugin_token
+        if: ${{ inputs.plugin_repository != '' && inputs.plugin_repo_app_id != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.plugin_repo_app_id }}
+          private-key: ${{ secrets.PLUGIN_REPO_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.plugin_repository }}
+          permission-contents: read
+
+      - name: Checkout plugin repository
+        if: ${{ inputs.plugin_repository != '' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          repository: ${{ inputs.plugin_repository }}
+          ref: ${{ inputs.plugin_ref }}
+          token: ${{ steps.plugin_token.outputs.token || secrets.PLUGIN_REPO_TOKEN || github.token }}
+          path: .claude-plugin-checkout
+          sparse-checkout: ${{ inputs.plugin_path }}
+          persist-credentials: false
+
+      - name: Move plugin out of the workspace
+        id: plugin
+        if: ${{ inputs.plugin_repository != '' }}
+        env:
+          PLUGIN_PATH: ${{ inputs.plugin_path }}
+          DEST: ${{ runner.temp }}/claude-plugins
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEST"
+          NAME=$(basename "$PLUGIN_PATH")
+          mv ".claude-plugin-checkout/$PLUGIN_PATH" "$DEST/$NAME"
+          rm -rf .claude-plugin-checkout
+          echo "dir=$DEST/$NAME" >> "$GITHUB_OUTPUT"
 
       # "$/" resolves to this workflow's own repository at the running commit, so the composite
       # action and its prompt always match this file. Needs runner 2.336.0+ (github.com has it).
@@ -220,6 +347,10 @@ jobs:
           fallback_model: ${{ inputs.fallback_model }}
           budget: ${{ inputs.budget_usd }}
           debounce_seconds: ${{ inputs.debounce_seconds }}
+          skill: ${{ inputs.skill }}
+          plugin_dirs: ${{ steps.plugin.outputs.dir }}
+          extra_allowed_tools: ${{ inputs.extra_allowed_tools }}
+          comment_marker: ${{ inputs.comment_marker }}
 
   post:
     name: post
@@ -234,6 +365,7 @@ jobs:
           review: ${{ needs.review.outputs.review }}
           pr_number: ${{ needs.gate.outputs.pr_number }}
           post_status: ${{ inputs.post_status }}
+          comment_marker: ${{ inputs.comment_marker }}
 
   # Scheduled self-check (callers add `on: schedule`). A review that never starts, e.g. because
   # the anthropics/claude-code-action ref fell off the org allowlist, is indistinguishable from a

@@ -59,6 +59,31 @@ inputs:
     description: Seconds to wait before collecting context when triggered by a plan comment.
     required: false
     default: "45"
+  skill:
+    description: >-
+      Run a Claude Code skill instead of the built-in plan/Helm review, e.g.
+      "/workgroups review {pr}". "{pr}" is replaced with the PR number. The skill must come from
+      the checked-out repository or from `plugin_dirs`.
+    required: false
+    default: ""
+  plugin_dirs:
+    description: >-
+      Newline-separated local directories of Claude Code plugins to load (`--plugin-dir`).
+      Hooks and MCP server definitions inside them are removed before loading; CI runs skills only.
+    required: false
+    default: ""
+  extra_allowed_tools:
+    description: >-
+      Newline-separated permission rules added to the allow list, e.g. "Bash(git log:*)" or
+      "WebFetch(domain:example.com)". Write, Edit and AskUserQuestion stay denied.
+    required: false
+    default: ""
+  comment_marker:
+    description: >-
+      Identifier embedded as `<!-- <marker> -->` in the posted comment. Callers running several
+      reviews on one repository give each its own marker so they do not collapse each other.
+    required: false
+    default: claude-review
 
 outputs:
   review:
@@ -220,6 +245,53 @@ runs:
         rm -rf .claude .mcp.json
         find . -maxdepth 3 -name .mcp.json -exec rm -f {} + 2>/dev/null || true
 
+    # Plugins supply skills only. Their hooks would run shell with the API key in the
+    # environment and their MCP servers need binaries the runner does not have.
+    - name: Prepare plugins
+      id: plugins
+      shell: bash
+      env:
+        PLUGIN_DIRS: ${{ inputs.plugin_dirs }}
+      run: |
+        set -euo pipefail
+        ARGS=""
+        while read -r DIR; do
+          [[ -z "$DIR" ]] && continue
+          if [[ ! -f "$DIR/.claude-plugin/plugin.json" ]]; then
+            echo "::error::No plugin at '$DIR' (missing .claude-plugin/plugin.json)."
+            exit 1
+          fi
+          rm -rf "$DIR/hooks" "$DIR/.mcp.json"
+          echo "Loading plugin $(jq -r .name "$DIR/.claude-plugin/plugin.json") from $DIR"
+          ARGS+=" --plugin-dir \"$DIR\""
+        done <<< "$PLUGIN_DIRS"
+        echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+    - name: Build tool allow list
+      id: tools
+      shell: bash
+      env:
+        EXTRA: ${{ inputs.extra_allowed_tools }}
+        SKILL: ${{ inputs.skill }}
+      run: |
+        set -euo pipefail
+        ARGS=""
+        [[ -n "$SKILL" ]] && ARGS+=" Skill"
+        while read -r RULE; do
+          [[ -z "$RULE" ]] && continue
+          # One permission rule per line; quotes and newlines would break the argument list.
+          if [[ "$RULE" =~ [\"\'] || ! "$RULE" =~ ^[A-Za-z_]+(\(.*\))?$ ]]; then
+            echo "::error::Not a permission rule: '$RULE'."
+            exit 1
+          fi
+          ARGS+=" \"$RULE\""
+        done <<< "$EXTRA"
+        if [[ -n "$ARGS" ]]; then
+          echo "args=--allowedTools$ARGS" >> "$GITHUB_OUTPUT"
+        else
+          echo "args=" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Build prompt
       id: prompt
       shell: bash
@@ -230,6 +302,7 @@ runs:
         REPOSITORY: ${{ github.repository }}
         CTX: ${{ steps.pr.outputs.ctx }}
         TRIGGER: ${{ inputs.trigger }}
+        SKILL: ${{ inputs.skill }}
       run: |
         set -euo pipefail
         DELIM="EOF_$(head -c 8 /dev/urandom | xxd -p)"
@@ -238,10 +311,17 @@ runs:
           echo "You are reviewing pull request #${PR_NUMBER} in repository ${REPOSITORY}."
           echo "Context directory: ${CTX}"
           echo "Trigger: ${TRIGGER}"
+          if [[ -n "$SKILL" ]]; then
+            echo "Skill to run: ${SKILL//\{pr\}/$PR_NUMBER}"
+          fi
           echo "Manifest:"
           cat "$CTX/manifest.json"
           echo
-          cat "$ACTION_PATH/prompt.md"
+          if [[ -n "$SKILL" ]]; then
+            cat "$ACTION_PATH/skill-prompt.md"
+          else
+            cat "$ACTION_PATH/prompt.md"
+          fi
           if [[ -n "$EXTRA_PROMPT" ]]; then
             echo
             echo "## Repository-specific review guidelines"
@@ -290,6 +370,10 @@ runs:
           --allowedTools Read Grep Glob
           --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
           --allowedTools "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
+          ${{ steps.tools.outputs.args }}
+          --disallowedTools Write Edit NotebookEdit AskUserQuestion
+          --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(git push:*)"
+          ${{ steps.plugins.outputs.args }}
 
     # Runs after a failure too, so a budget cap or crash still produces a legible result.
     - name: Prepare review
@@ -303,6 +387,8 @@ runs:
         BUDGET: ${{ inputs.budget }}
         MODEL: ${{ inputs.model }}
         TRIGGER: ${{ inputs.trigger }}
+        SKILL: ${{ inputs.skill }}
+        MARKER: ${{ inputs.comment_marker }}
         PR_NUMBER: ${{ inputs.pr_number }}
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         CTX: ${{ steps.pr.outputs.ctx }}
@@ -354,11 +440,11 @@ runs:
         MANIFEST=$(cat "$CTX/manifest.json" 2>/dev/null || echo '{}')
         BODY=$(jq -rn --arg note "$NOTE" --arg structured "$STRUCTURED" --arg trigger "$TRIGGER" \
           --arg cost "$COST" --arg turns "$TURNS" --arg secs "$SECS" --arg model "${MODEL:-default}" --arg run "$RUN_URL" \
-          --argjson manifest "$MANIFEST" '
+          --arg marker "$MARKER" --arg skill "$SKILL" --argjson manifest "$MANIFEST" '
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
-          [ "<!-- claude-review -->",
+          [ "<!-- " + $marker + " -->",
             "### Claude review: " + (if $r == null then "no review produced" else $r.verdict end),
             "",
             (if $r == null then "" else
@@ -366,6 +452,8 @@ runs:
               + "  |  **Reviewed:** " + (if ($r.sources_reviewed | length) > 0 then ($r.sources_reviewed | join(", ")) else "nothing" end)
               + (if ($r.sources_missing | length) > 0 then "  |  **Missing:** " + ($r.sources_missing | join(", ")) else "" end)
             end),
+            "",
+            (if $r == null or (($r.summary_markdown // "") == "") then "" else $r.summary_markdown end),
             "",
             (if $r == null then "" elif ($r.findings | length) == 0 then "_No findings._" else
               "#### Findings\n" + ($r.findings | map(
@@ -378,7 +466,7 @@ runs:
             "",
             $note,
             "",
-            "<sub>trigger: " + $trigger + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
+            "<sub>trigger: " + $trigger + (if $skill != "" then " · skill: `" + $skill + "`" else "" end) + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
           ] | map(select(. != "")) | join("\n")')
 
         # Commit status semantics: success = a review was produced (findings or not; humans decide
