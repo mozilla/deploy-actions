@@ -170,7 +170,8 @@ jobs:
             });
 
             for (const comment of comments) {
-              const isOurs = comment.body.includes(marker) || legacyHeaders.some(h => comment.body.startsWith(h));
+              const body = comment.body ?? "";
+              const isOurs = body.includes(marker) || legacyHeaders.some(h => body.startsWith(h));
               if (isOurs && comment.user.type === "Bot") {
                 await github.graphql(`
                   mutation MinimizeComment($subjectId: ID!) {

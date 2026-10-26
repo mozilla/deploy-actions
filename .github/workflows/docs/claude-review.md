@@ -40,7 +40,7 @@ Triggers, by caller event:
 | `issue_comment` | A human comments the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts a run comment |
 | `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored PRs are skipped here but still get plan-triggered reviews |
 | `workflow_dispatch` | Pass `pr_number` |
-| `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, or when every run failed. With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. Needs `actions: read` |
+| `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every run failed, or when failures outnumber successes. With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
 
 If the `ANTHROPIC_API_KEY` secret is empty the gate skips with a notice, so a repository can adopt
 the caller before the secret exists without PR noise.
@@ -60,7 +60,7 @@ the caller before the secret exists without PR noise.
 | `debounce_seconds` | string | `45` | Wait after a plan comment so continuation comments and sibling stacks land first |
 | `post_status` | boolean | `false` | Publish a `claude-review` commit status (caller needs `statuses: write`) |
 | `pr_number` | string | `""` | Explicit PR number for `workflow_dispatch` callers |
-| `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match |
+| `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match. Bash pattern semantics: `*` also matches `/`, so `dir/*.yaml` covers subdirectories |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
 | `skill` | string | `""` | Skill mode: run a Claude Code skill such as `/workgroups review {pr}` instead of the plan/Helm review. `{pr}` is replaced with the PR number |
 | `plugin_artifact` | string | `""` | Artifact in this run holding a Claude Code plugin directory, uploaded by a caller job (see skill mode below). Hooks and MCP servers in the plugin are not loaded |
@@ -70,16 +70,21 @@ Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health c
 
 ## Permissions
 
-The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`.
-Callers must grant at least:
+The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`;
+the `post` and `health` jobs inherit the caller's grant. GitHub validates every called job's
+declared permissions against the caller's grant at startup, including jobs that `if:` skips, which
+is why only the minimum is declared inside. Callers must grant at least:
 
 ```yaml
 permissions:
   contents: read
   pull-requests: write
-  actions: read     # only with a schedule trigger (health check)
-  statuses: write   # only with post_status: true
+  actions: read     # with a schedule trigger (health check)
+  statuses: write   # with post_status: true
 ```
+
+Humans who comment the trigger phrase need write access to the repository; the action refuses
+others, and that run posts a "no review produced" comment.
 
 ## Usage
 
@@ -101,7 +106,7 @@ on:
 
 jobs:
   claude-review:
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v7
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
     permissions:
       contents: read
       pull-requests: write
@@ -119,7 +124,7 @@ Add a job to the workflow that calls `diff-rendered-charts`:
 ```yaml
 jobs:
   diff:
-    uses: mozilla/deploy-actions/.github/workflows/diff-rendered-charts.yml@v7
+    uses: mozilla/deploy-actions/.github/workflows/diff-rendered-charts.yml@v6.8.0
     permissions:
       contents: read
       pull-requests: write
@@ -127,7 +132,7 @@ jobs:
   claude-review:
     needs: diff
     if: needs.diff.outputs.changes_found == 'true'
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v7
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
     permissions:
       contents: read
       pull-requests: write
@@ -170,7 +175,7 @@ jobs:
           plugin: mozcloud-tools
   workgroup-review:
     needs: plugin
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v7
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
     permissions:
       contents: read
       pull-requests: write
@@ -191,8 +196,13 @@ jobs:
 In skill mode Claude is told to take the review-only path wherever the skill would ask a question
 or offer to post, and to report missing optional sources (Confluence, internal sites) instead of
 stopping. The skill's own summary is rendered in the comment via `summary_markdown`; its flags
-become findings. Plugin hooks and `.mcp.json` are stripped before loading, since hook scripts
-would run with the API key in the environment.
+become findings. Only the requested skill may be invoked. Before loading, the plugin's hooks,
+`.mcp.json` and every skill's `allowed-tools` frontmatter are removed (a skill's allow list would
+otherwise widen Claude's permissions even in a non-interactive run), hooks are disabled through
+settings, and network and GitHub-mutating commands are denied regardless of what a skill asks for.
+
+The `plugin` job's `if:` must mirror the shared gate's trigger filter; it exists only because a
+reusable workflow cannot take a `uses:` reference as an input.
 
 ### Using the composite actions directly
 
@@ -264,8 +274,11 @@ pin lives in this repository alone, with a Dependabot ignore rule. Callers refer
 - **Review cancelled.** A newer plan comment or request on the same PR superseded it. The newer run
   posts the review.
 - **"No review produced".** Usually the budget cap. Raise `budget_usd` or narrow `extra_prompt`.
-- **`startup_failure` on every run.** The `anthropics/claude-code-action` ref is no longer `@v1`
-  or the org allowlist changed. Fix it here once; every caller recovers.
+- **Every review fails with "no review produced".** Most likely the `anthropics/claude-code-action`
+  ref is no longer `@v1` or the org allowlist changed; because the action is resolved inside the
+  composite, this shows as a failed `review` job rather than `startup_failure`. Fix it here once;
+  every caller recovers. The scheduled health check reports it as "failed runs and no successful
+  review".
 - **Spacelift plans not reviewed.** The Spacelift notification policy must post run comments on
   the PR (see `spacelift/tf/root/policies/notification/` in global-platform-admin); the review
   reads comments, it does not call the Spacelift API.

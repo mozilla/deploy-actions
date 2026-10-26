@@ -68,8 +68,10 @@ inputs:
     default: ""
   plugin_dirs:
     description: >-
-      Newline-separated local directories of Claude Code plugins to load (`--plugin-dir`).
-      Hooks and MCP server definitions inside them are removed before loading; CI runs skills only.
+      Local directory of a Claude Code plugin to load (`--plugin-dir`); a tarball inside it is
+      unpacked first. Hooks, MCP server definitions and skill `allowed-tools` are removed before
+      loading; CI runs skills only. The action's argument parser keeps only the last
+      `--plugin-dir`, so pass one plugin.
     required: false
     default: ""
   extra_allowed_tools:
@@ -138,6 +140,8 @@ runs:
 
     - name: Download Helm diff artifact
       if: ${{ inputs.helm_diff_artifact != '' }}
+      # A missing artifact falls back to the PR comment, handled in the collect step.
+      continue-on-error: true
       uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 #v8.0.0
       with:
         name: ${{ inputs.helm_diff_artifact }}
@@ -188,18 +192,18 @@ runs:
             {
               echo "# $3"
               echo
-              jq -r "[.[] | select($1)][] | \"## \(.author.login) at \(.createdAt)\n<\(.url)>\n\n\(.body)\n\"" comments.json \
+              jq -r "[.[] | select($1)][] | \"## \(.author.login // \"ghost\") at \(.createdAt)\n<\(.url)>\n\n\(.body)\n\"" comments.json \
                 | sed -E 's/<!--[^>]*-->//g'
             } > "$2"
           fi
           echo "$n"
         }
 
-        ATL_SEL='(.author.login | sub("\\[bot\\]$"; "")) == "'"$ATLANTIS"'" and (.body | test("^Ran (Plan|Apply)|^Continued (plan|apply) output|Locks and plans deleted|currently locked|No changes. Your infrastructure|plan failed|Plan Error"; "i"))'
-        SPL_SEL='(.author.login | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
-        HELM_SEL='(.author.__typename == "Bot") and (.body | test("<!-- helm-diff -->|^Changes found in Helm charts\\.|^Continued from previous comment\\."))'
-        KUBE_SEL='(.author.__typename == "Bot") and (.body | test("<!-- kubeconform-marker -->"))'
-        HUMAN_SEL='(.author.__typename != "Bot") and ((.body | test("@claude")) | not)'
+        ATL_SEL='((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$ATLANTIS"'" and (.body | test("^Ran (Plan|Apply)|^Continued (plan|apply) output|Locks and plans deleted|currently locked|No changes. Your infrastructure|plan failed|Plan Error"; "i"))'
+        SPL_SEL='((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
+        HELM_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- helm-diff -->|^Changes found in Helm charts\\.|^Continued from previous comment\\."))'
+        KUBE_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- kubeconform-marker -->"))'
+        HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | test("@claude")) | not)'
 
         N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
         N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
@@ -245,8 +249,10 @@ runs:
         rm -rf .claude .mcp.json
         find . -maxdepth 3 -name .mcp.json -exec rm -f {} + 2>/dev/null || true
 
-    # Plugins supply skills only. Their hooks would run shell with the API key in the
-    # environment and their MCP servers need binaries the runner does not have.
+    # Plugins supply skills only. Hooks are arbitrary code that would run with the job token,
+    # MCP servers need binaries the runner does not have, and a skill's own `allowed-tools`
+    # frontmatter would widen Claude's permissions beyond the allow list below (it applies even
+    # in non-interactive runs). All three are removed; hooks are also disabled via settings.
     - name: Prepare plugins
       id: plugins
       shell: bash
@@ -257,11 +263,31 @@ runs:
         ARGS=""
         while read -r DIR; do
           [[ -z "$DIR" ]] && continue
+          # A plugin handed over as a tarball (preserves file modes) is unpacked in place.
+          if [[ ! -f "$DIR/.claude-plugin/plugin.json" ]]; then
+            for TGZ in "$DIR"/*.tgz "$DIR"/*.tar.gz; do
+              [[ -f "$TGZ" ]] || continue
+              tar -xzf "$TGZ" -C "$DIR" && rm -f "$TGZ"
+            done
+          fi
           if [[ ! -f "$DIR/.claude-plugin/plugin.json" ]]; then
             echo "::error::No plugin at '$DIR' (missing .claude-plugin/plugin.json)."
             exit 1
           fi
           rm -rf "$DIR/hooks" "$DIR/.mcp.json"
+          jq 'del(.hooks, .mcpServers)' "$DIR/.claude-plugin/plugin.json" > "$DIR/.claude-plugin/plugin.tmp" \
+            && mv "$DIR/.claude-plugin/plugin.tmp" "$DIR/.claude-plugin/plugin.json"
+          # Drop `allowed-tools:` (scalar or list) and `hooks:` from skill and agent frontmatter.
+          while IFS= read -r -d '' MD; do
+            awk '
+              NR == 1 && $0 == "---" { fm = 1; print; next }
+              fm && $0 == "---"        { fm = 0; print; next }
+              fm && /^(allowed-tools|hooks):/ { skip = 1; next }
+              fm && skip && /^[[:space:]]+/   { next }
+              fm && skip && /^-/              { next }
+              { skip = 0; print }
+            ' "$MD" > "$MD.tmp" && mv "$MD.tmp" "$MD"
+          done < <(find "$DIR/skills" "$DIR/agents" -name '*.md' -print0 2>/dev/null)
           echo "Loading plugin $(jq -r .name "$DIR/.claude-plugin/plugin.json") from $DIR"
           ARGS+=" --plugin-dir \"$DIR\""
         done <<< "$PLUGIN_DIRS"
@@ -276,7 +302,15 @@ runs:
       run: |
         set -euo pipefail
         ARGS=""
-        [[ -n "$SKILL" ]] && ARGS+=" Skill"
+        if [[ -n "$SKILL" ]]; then
+          # "/workgroups review {pr}" -> only that skill may be invoked, with any arguments.
+          NAME=$(printf '%s' "$SKILL" | sed -E 's#^/##; s/[[:space:]].*$//')
+          if [[ ! "$NAME" =~ ^[A-Za-z0-9_:-]+$ ]]; then
+            echo "::error::Cannot derive a skill name from '$SKILL'."
+            exit 1
+          fi
+          ARGS+=" \"Skill($NAME)\" \"Skill($NAME:*)\""
+        fi
         while read -r RULE; do
           [[ -z "$RULE" ]] && continue
           # One permission rule per line; quotes and newlines would break the argument list.
@@ -330,18 +364,14 @@ runs:
           fi
           echo "$DELIM"
         } >> "$GITHUB_OUTPUT"
-        echo "schema=$(jq -c . "$ACTION_PATH/schema.json")" >> "$GITHUB_OUTPUT"
-
-    # A prompt injection in the review step cannot reach the artifact/cache API or mint an OIDC
-    # token without these. The Helm artifact was already downloaded above.
-    - name: Unset runner tokens before the agent step
-      shell: bash
-      run: |
-        {
-          echo "ACTIONS_RUNTIME_TOKEN="
-          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN="
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL="
-        } >> "$GITHUB_ENV"
+        # The action splits claude_args like a shell, so the schema is single-quoted there and
+        # must not contain a bare single quote.
+        SCHEMA=$(jq -c . "$ACTION_PATH/schema.json")
+        if [[ "$SCHEMA" == *"'"* ]]; then
+          echo "::error::schema.json must not contain single quotes."
+          exit 1
+        fi
+        echo "schema=$SCHEMA" >> "$GITHUB_OUTPUT"
 
     - name: Run Claude review
       id: claude
@@ -359,20 +389,26 @@ runs:
         # Plan comments are authored by apps; the action rejects bot actors unless listed.
         allowed_bots: ${{ inputs.atlantis_bot }},${{ inputs.spacelift_bot }}
         include_fix_links: false
+        # No hooks from any source: the checkout's .claude/ is removed above, but plugins and
+        # skills can declare hooks in several places.
+        settings: '{"disableAllHooks": true}'
         prompt: ${{ steps.prompt.outputs.content }}
         # Path rules: "/x" anchors at the workspace, "//x" is the filesystem root.
         claude_args: |
           ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
           ${{ inputs.fallback_model && format('--fallback-model {0}', inputs.fallback_model) || '' }}
           --max-budget-usd ${{ inputs.budget }}
-          --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments or edit files; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to gh pr diff and gh pr view."
+          --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments, edit files or ask questions; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to the allowed commands (gh pr diff, gh pr view, and any the caller added); anything else is denied."
           --json-schema '${{ steps.prompt.outputs.schema }}'
           --allowedTools Read Grep Glob
           --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
           --allowedTools "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
           ${{ steps.tools.outputs.args }}
-          --disallowedTools Write Edit NotebookEdit AskUserQuestion
-          --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(git push:*)"
+          --disallowedTools Write Edit NotebookEdit AskUserQuestion WebSearch
+          --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(gh pr edit:*)" "Bash(gh pr close:*)" "Bash(gh pr ready:*)"
+          --disallowedTools "Bash(gh api:*)" "Bash(gh issue:*)" "Bash(gh release:*)" "Bash(gh workflow:*)" "Bash(gh run:*)" "Bash(gh secret:*)" "Bash(gh variable:*)"
+          --disallowedTools "Bash(curl:*)" "Bash(wget:*)" "Bash(git push:*)" "Bash(git remote:*)" "Bash(git config:*)" "Bash(git credential:*)"
+          --disallowedTools "Read(/.git/**)"
           ${{ steps.plugins.outputs.args }}
 
     # Runs after a failure too, so a budget cap or crash still produces a legible result.
@@ -437,10 +473,9 @@ runs:
           NOTE="> [!WARNING]"$'\n'"> The review step ended with \`$OUTCOME\`; the review may be incomplete."
         fi
 
-        MANIFEST=$(cat "$CTX/manifest.json" 2>/dev/null || echo '{}')
         BODY=$(jq -rn --arg note "$NOTE" --arg structured "$STRUCTURED" --arg trigger "$TRIGGER" \
           --arg cost "$COST" --arg turns "$TURNS" --arg secs "$SECS" --arg model "${MODEL:-default}" --arg run "$RUN_URL" \
-          --arg marker "$MARKER" --arg skill "$SKILL" --argjson manifest "$MANIFEST" '
+          --arg marker "$MARKER" --arg skill "$SKILL" '
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
@@ -475,7 +510,7 @@ runs:
         if [[ -z "$STRUCTURED" ]]; then
           STATE=failure; DESCRIPTION="No review produced"
         else
-          STATE=success; DESCRIPTION=$(jq -r '.verdict' <<< "$STRUCTURED" | cut -c1-140)
+          STATE=success; DESCRIPTION=$(jq -r '.verdict | gsub("\\s+"; " ") | .[:140]' <<< "$STRUCTURED")
         fi
 
         {

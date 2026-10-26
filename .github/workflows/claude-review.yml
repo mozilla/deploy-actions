@@ -209,8 +209,11 @@ jobs:
           fi
 
           # Path filters apply to every trigger, since issue_comment events carry no paths.
+          # Globs use bash pattern matching: `*` also matches `/` (unlike GitHub's `paths:`).
           if [[ -n "$PATHS" || -n "$PATHS_IGNORE" ]]; then
-            mapfile -t FILES < <(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename')
+            FILE_LIST=$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename') \
+              || skip "could not list the changed files of PR #$PR_NUMBER."
+            mapfile -t FILES <<< "$FILE_LIST"
             matches_any() {  # $1 = newline-separated globs; true if any changed file matches any glob
               local f g
               while read -r g; do
@@ -330,8 +333,9 @@ jobs:
     name: health check
     if: ${{ github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
+    # No permissions block on purpose: GitHub validates every called job's permissions against
+    # the caller's grant at startup, even for jobs that `if:` skips, so declaring `actions: read`
+    # here would startup-fail every caller without it. Schedule callers grant it themselves.
     steps:
       - name: Audit recent runs of this workflow
         env:
@@ -345,9 +349,11 @@ jobs:
           SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
           gh run list --repo "$REPOSITORY" --workflow "$WORKFLOW" --created ">$SINCE" --limit 500 \
             --json conclusion,status,event > runs.json
+          # In-progress runs have conclusion "" (truthy in jq), hence the explicit fallback.
           SUMMARY=$(jq -r '
+            def outcome: if (.conclusion // "") == "" then .status else .conclusion end;
             map(select(.event != "schedule"))
-            | group_by(.conclusion // .status) | map({k: .[0].conclusion // .[0].status, n: length})
+            | group_by(outcome) | map({k: (.[0] | outcome), n: length})
             | sort_by(-.n) | map("| \(.k) | \(.n) |") | join("\n")' runs.json)
           STARTUP=$(jq '[.[] | select(.conclusion == "startup_failure")] | length' runs.json)
           FAILED=$(jq '[.[] | select(.event != "schedule" and .conclusion == "failure")] | length' runs.json)
@@ -360,11 +366,15 @@ jobs:
             echo "${SUMMARY:-| (no runs) | 0 |}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # The claude-code-action ref is resolved inside the composite at job time, so an
+          # allowlist break shows up as review-job failures, not startup_failure. Both are covered.
           PROBLEM=""
           if [[ "$STARTUP" -gt 0 ]]; then
-            PROBLEM="$STARTUP run(s) ended in startup_failure: the workflow is not starting at all (check the anthropics/claude-code-action ref against the org allowlist)."
+            PROBLEM="$STARTUP run(s) ended in startup_failure: the caller workflow itself is not starting."
           elif [[ "$FAILED" -gt 0 && "$OK" -eq 0 ]]; then
-            PROBLEM="$FAILED failed run(s) and no successful review in 7 days."
+            PROBLEM="$FAILED failed run(s) and no successful review in 7 days (check the anthropics/claude-code-action ref against the org allowlist)."
+          elif [[ "$FAILED" -gt "$OK" ]]; then
+            PROBLEM="$FAILED failed run(s) against $OK successful in 7 days."
           fi
           if [[ -z "$PROBLEM" ]]; then
             echo "Healthy: $OK successful review run(s), $FAILED failed, $STARTUP startup failures."
