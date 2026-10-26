@@ -1,0 +1,94 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "status",
+    "findings",
+    "sources_reviewed",
+    "sources_missing"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "One factual sentence. Example: Plan matches the PR intent; Helm diff only bumps the image tag."
+    },
+    "status": {
+      "enum": [
+        "clean",
+        "findings",
+        "incomplete"
+      ],
+      "description": "clean: everything reviewed, nothing to raise. findings: at least one finding. incomplete: a source that should exist was missing or unreadable."
+    },
+    "summary_markdown": {
+      "type": "string",
+      "description": "Optional free-form Markdown rendered above the findings. Use it for a structured review summary when a skill produces one (author relationship, ticket linkage, approval chain, recommendation). Leave empty for plan and Helm reviews."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "source",
+          "title",
+          "detail"
+        ],
+        "properties": {
+          "severity": {
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "source": {
+            "enum": [
+              "terraform-plan",
+              "spacelift-plan",
+              "helm-diff",
+              "code",
+              "ci"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "detail": {
+            "type": "string"
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Resource addresses, file paths, stack or project names, quoted plan or diff lines."
+          }
+        }
+      }
+    },
+    "apply_readiness": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Short factual statements about whether the change is ready to apply: plans present for every touched project, lock contention, stale plan, autodeploy on merge, failing checks."
+    },
+    "sources_reviewed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sources_missing": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
