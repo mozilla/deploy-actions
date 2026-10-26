@@ -85,7 +85,8 @@ on:
       skill:
         description: >-
           Run a Claude Code skill instead of the built-in plan/Helm review, e.g.
-          "/workgroups review {pr}". Pair with the plugin_* inputs when the skill lives in a plugin.
+          "/workgroups review {pr}". The skill must come from the plugin passed via plugin_artifact;
+          the checkout's own .claude/ is not loaded.
         type: string
         default: ""
       plugin_artifact:
