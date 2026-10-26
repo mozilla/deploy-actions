@@ -103,7 +103,7 @@ runs:
 
         if [[ "$POST_STATUS" == "true" && -n "$HEAD_SHA" ]]; then
           STATE=$(jq -r .state <<< "$REVIEW")
-          DESCRIPTION=$(jq -r .description <<< "$REVIEW" | cut -c1-140)
+          DESCRIPTION=$(jq -r '.description | gsub("\\s+"; " ") | .[:140]' <<< "$REVIEW")
           gh api --method POST "repos/$REPOSITORY/statuses/$HEAD_SHA" \
             -f state="$STATE" -f context="$STATUS_CONTEXT" -f description="$DESCRIPTION" -f target_url="$URL" > /dev/null \
             || echo "::warning::Could not set commit status (needs statuses: write)."

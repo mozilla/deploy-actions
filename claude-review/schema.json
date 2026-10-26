@@ -12,7 +12,7 @@
     "verdict": {
       "type": "string",
       "maxLength": 200,
-      "description": "One factual sentence. Example: 'Plan matches the PR intent; Helm diff only bumps the image tag.'"
+      "description": "One factual sentence. Example: Plan matches the PR intent; Helm diff only bumps the image tag."
     },
     "status": {
       "enum": [
