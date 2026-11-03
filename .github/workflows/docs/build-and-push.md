@@ -32,6 +32,22 @@ See their documentation for more details on some of these inputs.
 | `service_account_name`                  | false    | string  | GCP service account for pushing to registry. (default: `"artifact-writer"`)                                     |
 | `enable_attestations`                   | false    | boolean | Enable SBOM and provenance attestations for supply chain security. (default: `false`)                           |
 | `push`                                  | false    | boolean | Set to false to validate build steps without pushing to repository. (default: `true`)                           |
+| `environment`                           | false    | string  | GitHub Actions environment to run the job in, e.g. `build`. (default: none)                                     |
+
+### `environment`
+
+Tenants created with `tenant_bootstrap` only let jobs in the `build` environment use the `artifact-writer`
+service account (`github_require_build_env`, which defaults to `true`). A job that calls a reusable workflow
+can't set `environment` itself, so pass it here:
+
+```yaml
+    with:
+      environment: build
+```
+
+Without it, the push fails with `Permission 'iam.serviceAccounts.getAccessToken' denied`.
+Restrict the `build` environment to your release branches and tags in the repository settings.
+GitHub creates a missing environment on first use, with no restrictions.
 
 ### `enable_attestations`
 

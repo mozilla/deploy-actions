@@ -74,10 +74,16 @@ on:
         type: boolean
         default: true
         description: Set to false to validate build steps without pushing to repository
+      environment:
+        required: false
+        type: string
+        default: ""
+        description: GitHub Actions environment to run the job in, e.g. "build"
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout Repository
