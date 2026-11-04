@@ -440,7 +440,7 @@ runs:
             (if $r == null then null elif ($r.findings | length) == 0 then "_No findings._" else
               "#### Findings\n" + ($r.findings | map(
                 "- **" + ((.severity // "low") | sev) + "** · `" + ((.source // "code") | safe) + "` · **" + (.title | safe) + "**\n  " + (.detail | safe | gsub("\n"; "\n  "))
-                + (if ((.references // []) | length) > 0 then "\n  " + (.references | map("`" + (safe | gsub("`"; "'")) + "`") | join(", ")) else "" end)
+                + (if ((.references // []) | length) > 0 then "\n  " + (.references | map("`" + (safe | gsub("`"; "\u0027")) + "`") | join(", ")) else "" end)
               ) | join("\n")) end),
             (if $r == null or (($r.apply_readiness // []) | length) == 0 then null else
               "#### Apply readiness\n" + list($r.apply_readiness; "") end),
