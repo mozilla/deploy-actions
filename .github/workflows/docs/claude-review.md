@@ -38,7 +38,7 @@ Triggers, by caller event:
 
 | Caller event | When the review runs |
 |---|---|
-| `issue_comment` | A human with write access (owner, member or collaborator) posts a comment containing the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts or edits a run comment. Subscribe to `created` and `edited`; edits by humans are ignored |
+| `issue_comment` | A human with write access (owner, member or collaborator) posts a comment containing the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts or edits a run comment. Subscribe to `created` and `edited`; edits by humans are ignored, and so are the `edited` events Atlantis raises when it minimizes its previous plan comments |
 | `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored PRs are skipped here but still get plan-triggered reviews |
 | `workflow_dispatch` | Pass `pr_number` |
 | `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every `review` job failed, or when failed `review` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |

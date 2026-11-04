@@ -104,15 +104,18 @@ jobs:
           (github.event.action == 'created' && github.event.comment.user.type != 'Bot' &&
            contains(github.event.comment.body, inputs.trigger_phrase) &&
            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-          (inputs.mode == 'auto' && startsWith(github.event.comment.body, 'Ran Plan') &&
+          (inputs.mode == 'auto' && github.event.action == 'created' &&
+           startsWith(github.event.comment.body, 'Ran Plan') &&
            contains(format(',{0},{0}[bot],', inputs.atlantis_bot), format(',{0},', github.event.comment.user.login))) ||
           (inputs.mode == 'auto' && contains(github.event.comment.body, 'spacelift.io/stack/') &&
            contains(format(',{0},{0}[bot],', inputs.spacelift_bot), format(',{0},', github.event.comment.user.login)))
         )
       ))
     # Bot logins are accepted with or without the "[bot]" suffix. Edited comments count only for
-    # bots (Spacelift updates its comments in place); humans trigger by posting a new comment,
-    # and only with write access to the repository (OWNER, MEMBER or COLLABORATOR).
+    # Spacelift, which updates its comments in place. Atlantis only creates comments, and when it
+    # minimizes its previous plan comments GitHub raises `edited` events for them; without the
+    # `created` check each new plan would start a second run. Humans trigger by posting a new
+    # comment, and only with write access to the repository (OWNER, MEMBER or COLLABORATOR).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -135,6 +138,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_LOGIN: ${{ github.event.comment.user.login }}
           COMMENT_TYPE: ${{ github.event.comment.user.type }}
+          COMMENT_ACTION: ${{ github.event.action }}
           TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
           ATLANTIS_BOT: ${{ inputs.atlantis_bot }}
           SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
@@ -159,6 +163,8 @@ jobs:
               if [[ "$COMMENT_TYPE" != "Bot" && "$COMMENT_BODY" == *"$TRIGGER_PHRASE"* ]]; then
                 TRIGGER=on-demand
               elif [[ "$LOGIN" == "${ATLANTIS_BOT%\[bot\]}" ]]; then
+                # Minimizing older plan comments raises `edited` events with the same body.
+                [[ "$COMMENT_ACTION" == "created" ]] || skip "Atlantis comment was edited, not posted."
                 TRIGGER=atlantis-plan
               elif [[ "$LOGIN" == "${SPACELIFT_BOT%\[bot\]}" ]]; then
                 # Deploy notifications (posted after merge) are not plans.
