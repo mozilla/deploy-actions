@@ -62,9 +62,6 @@ the caller before the secret exists without PR noise.
 | `pr_number` | string | `""` | Explicit PR number for `workflow_dispatch` callers |
 | `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match. Bash pattern semantics: `*` also matches `/`, so `dir/*.yaml` covers subdirectories |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
-| `skill` | string | `""` | Skill mode: run a Claude Code skill such as `/workgroups review {pr}` instead of the plan/Helm review. `{pr}` is replaced with the PR number |
-| `plugin_artifact` | string | `""` | Artifact in this run holding a Claude Code plugin directory, uploaded by a caller job (see skill mode below). Hooks and MCP servers in the plugin are not loaded |
-| `extra_allowed_tools` | string | `""` | Permission rules added in skill mode, one per line (`Bash(git log:*)`, `WebFetch(domain:example.com)`). Write, Edit and AskUserQuestion stay denied |
 
 Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only).
 
@@ -141,71 +138,6 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
-
-### Skill mode: run a plugin skill on matching PRs
-
-Runs the mozcloud-tools `workgroups` skill whenever Atlantis plans a PR that changes a workgroup
-file, and on `@claude`. The plugin lives in `mozilla/mozcloud`, an internal repository the
-default token cannot check out, but whose Actions access setting lets other Mozilla repositories
-run its actions. A short caller job runs `mozilla/mozcloud/claude/actions/plugin`, which uploads
-the plugin directory as an artifact; no token changes hands. A second caller on the same
-repository needs its own `comment_marker`, and the generic caller should `paths_ignore` the same
-files so the PR gets one review, not two.
-
-```yaml
-# .github/workflows/workgroup-review.yaml
-on:
-  issue_comment:
-    types: [created]
-jobs:
-  plugin:
-    # Same cheap pre-filter as the shared gate, so unrelated comments start no runner.
-    if: >-
-      github.event.issue.pull_request &&
-      (contains(github.event.comment.body, '@claude') ||
-       startsWith(github.event.comment.body, 'Ran Plan'))
-    runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      artifact: ${{ steps.plugin.outputs.artifact }}
-    steps:
-      - id: plugin
-        uses: mozilla/mozcloud/claude/actions/plugin@<sha>
-        with:
-          plugin: mozcloud-tools
-  workgroup-review:
-    needs: plugin
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
-    permissions:
-      contents: read
-      pull-requests: write
-    with:
-      comment_marker: claude-review-workgroups
-      atlantis_bot: ${{ vars.ATLANTIS_GITHUB_USER }}
-      paths: |
-        google-workspace-management/tf/workgroups/*.yaml
-      skill: "/workgroups review {pr}"
-      plugin_artifact: ${{ needs.plugin.outputs.artifact }}
-      extra_allowed_tools: |
-        Bash(git log:*)
-        WebFetch(domain:protosaur.dev)
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-```
-
-In skill mode Claude is told to take the review-only path wherever the skill would ask a question
-or offer to post, and to report missing optional sources (Confluence, internal sites) instead of
-stopping. The skill's own summary is rendered in the comment via `summary_markdown`; its flags
-become findings. Only the requested skill may be invoked, by its bare name or its plugin-prefixed
-name (`workgroups` or `mozcloud-tools:workgroups`); the skill must come from the plugin, since the
-checkout's own `.claude/`, `CLAUDE.md` and `AGENTS.md` are removed and memory files are not loaded.
-Before loading, the plugin's hooks, `.mcp.json` and every skill's `allowed-tools` frontmatter are
-removed (a skill's allow list would otherwise widen Claude's permissions even in a non-interactive
-run), hooks are disabled through settings, and network and GitHub-mutating commands are denied
-regardless of what a skill asks for.
-
-The `plugin` job's `if:` must mirror the shared gate's trigger filter; it exists only because a
-reusable workflow cannot take a `uses:` reference as an input.
 
 ### Using the composite actions directly
 

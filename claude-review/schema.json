@@ -24,7 +24,7 @@
     },
     "summary_markdown": {
       "type": "string",
-      "description": "Optional free-form Markdown rendered above the findings. Use it for a structured review summary when a skill produces one (author relationship, ticket linkage, approval chain, recommendation). Leave empty for plan and Helm reviews."
+      "description": "Optional free-form Markdown rendered above the findings. Leave empty unless the repository-specific guidelines ask for a structured summary."
     },
     "findings": {
       "type": "array",

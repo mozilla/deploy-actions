@@ -59,28 +59,6 @@ inputs:
     description: Seconds to wait before collecting context when triggered by a plan comment.
     required: false
     default: "45"
-  skill:
-    description: >-
-      Run a Claude Code skill instead of the built-in plan/Helm review, e.g.
-      "/workgroups review {pr}". "{pr}" is replaced with the PR number. The skill must come from a
-      plugin passed via `plugin_dirs`; the checkout's own `.claude/` is removed before Claude runs.
-      Name it bare ("workgroups") or with its plugin prefix ("mozcloud-tools:workgroups").
-    required: false
-    default: ""
-  plugin_dirs:
-    description: >-
-      Local directory of a Claude Code plugin to load (`--plugin-dir`); a tarball inside it is
-      unpacked first. Hooks, MCP server definitions and skill `allowed-tools` are removed before
-      loading; CI runs skills only. The action's argument parser keeps only the last
-      `--plugin-dir`, so pass one plugin.
-    required: false
-    default: ""
-  extra_allowed_tools:
-    description: >-
-      Newline-separated permission rules added to the allow list, e.g. "Bash(git log:*)" or
-      "WebFetch(domain:example.com)". Write, Edit and AskUserQuestion stay denied.
-    required: false
-    default: ""
   comment_marker:
     description: >-
       Identifier embedded as `<!-- <marker> -->` in the posted comment. Callers running several
@@ -254,110 +232,6 @@ runs:
           \( -name .mcp.json -o -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md \) \
           -exec rm -f {} + 2>/dev/null || true
 
-    # Plugins supply skills only. Hooks are arbitrary code that would run with the job token,
-    # MCP servers need binaries the runner does not have, and a skill's own `allowed-tools`
-    # frontmatter would widen Claude's permissions beyond the allow list below (it applies even
-    # in non-interactive runs). All three are removed; hooks are also disabled via settings.
-    - name: Prepare plugins
-      id: plugins
-      shell: bash
-      env:
-        PLUGIN_DIRS: ${{ inputs.plugin_dirs }}
-      run: |
-        set -euo pipefail
-        ARGS=""
-        NAMES=""
-        while read -r DIR; do
-          [[ -z "$DIR" ]] && continue
-          # A plugin handed over as a tarball (preserves file modes) is unpacked in place.
-          if [[ ! -f "$DIR/.claude-plugin/plugin.json" ]]; then
-            for TGZ in "$DIR"/*.tgz "$DIR"/*.tar.gz; do
-              [[ -f "$TGZ" ]] || continue
-              tar -xzf "$TGZ" -C "$DIR" && rm -f "$TGZ"
-            done
-          fi
-          if [[ ! -f "$DIR/.claude-plugin/plugin.json" ]]; then
-            echo "::error::No plugin at '$DIR' (missing .claude-plugin/plugin.json)."
-            exit 1
-          fi
-          rm -rf "$DIR/hooks" "$DIR/.mcp.json"
-          jq 'del(.hooks, .mcpServers)' "$DIR/.claude-plugin/plugin.json" > "$DIR/.claude-plugin/plugin.tmp" \
-            && mv "$DIR/.claude-plugin/plugin.tmp" "$DIR/.claude-plugin/plugin.json"
-          # Drop `allowed-tools:` (scalar or list, blank lines included) and `hooks:` from skill,
-          # command and agent frontmatter. CRLF line endings are normalised so "---" matches.
-          MD_DIRS=("$DIR/skills" "$DIR/commands" "$DIR/agents")
-          while IFS= read -r -d '' MD; do
-            awk '
-              { sub(/\r$/, "") }
-              NR == 1 && $0 == "---" { fm = 1; print; next }
-              fm && $0 == "---"        { fm = 0; skip = 0; print; next }
-              fm && /^(allowed-tools|hooks):/ { skip = 1; next }
-              fm && skip && (/^[[:space:]]/ || /^-/ || /^$/) { next }
-              { skip = 0; print }
-            ' "$MD" > "$MD.tmp" && mv "$MD.tmp" "$MD"
-          done < <(find "${MD_DIRS[@]}" -name '*.md' -print0 2>/dev/null)
-          # Fail closed if any frontmatter still carries either key.
-          LEFT=$(find "${MD_DIRS[@]}" -name '*.md' -print0 2>/dev/null | xargs -0 -r awk '
-              FNR == 1 { fm = ($0 == "---") ; next }
-              fm && $0 == "---" { fm = 0 }
-              fm && /^(allowed-tools|hooks):/ { print FILENAME }')
-          if [[ -n "$LEFT" ]]; then
-            echo "::error::allowed-tools/hooks still present in frontmatter:"; echo "$LEFT"
-            exit 1
-          fi
-          NAME=$(jq -r '.name // empty' "$DIR/.claude-plugin/plugin.json")
-          if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
-            echo "::error::Plugin at '$DIR' has no valid name in plugin.json."
-            exit 1
-          fi
-          echo "Loading plugin $NAME from $DIR"
-          ARGS+=" --plugin-dir \"$DIR\""
-          NAMES+=" $NAME"
-        done <<< "$PLUGIN_DIRS"
-        echo "args=$ARGS" >> "$GITHUB_OUTPUT"
-        echo "names=${NAMES# }" >> "$GITHUB_OUTPUT"
-
-    - name: Build tool allow list
-      id: tools
-      shell: bash
-      env:
-        EXTRA: ${{ inputs.extra_allowed_tools }}
-        SKILL: ${{ inputs.skill }}
-        PLUGINS: ${{ steps.plugins.outputs.names }}
-      run: |
-        set -euo pipefail
-        ARGS=""
-        if [[ -n "$SKILL" ]]; then
-          # "/workgroups review {pr}" -> only that skill may be invoked, with any arguments.
-          # Skill rules take "Skill(name)" and "Skill(name *)". Plugin skills are registered as
-          # "<plugin>:<name>", so the namespaced forms are allowed as well when a bare name is given.
-          NAME=$(printf '%s' "$SKILL" | sed -E 's#^/##; s/[[:space:]].*$//')
-          if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+(:[A-Za-z0-9_-]+)?$ ]]; then
-            echo "::error::Cannot derive a skill name from '$SKILL'."
-            exit 1
-          fi
-          ARGS+=" \"Skill($NAME)\" \"Skill($NAME *)\""
-          if [[ "$NAME" != *:* ]]; then
-            for PLUGIN in $PLUGINS; do
-              ARGS+=" \"Skill($PLUGIN:$NAME)\" \"Skill($PLUGIN:$NAME *)\""
-            done
-          fi
-        fi
-        while read -r RULE; do
-          [[ -z "$RULE" ]] && continue
-          # One permission rule per line; quotes and newlines would break the argument list.
-          if [[ "$RULE" =~ [\"\'] || ! "$RULE" =~ ^[A-Za-z_]+(\(.*\))?$ ]]; then
-            echo "::error::Not a permission rule: '$RULE'."
-            exit 1
-          fi
-          ARGS+=" \"$RULE\""
-        done <<< "$EXTRA"
-        if [[ -n "$ARGS" ]]; then
-          echo "args=--allowedTools$ARGS" >> "$GITHUB_OUTPUT"
-        else
-          echo "args=" >> "$GITHUB_OUTPUT"
-        fi
-
     - name: Build prompt
       id: prompt
       shell: bash
@@ -368,7 +242,6 @@ runs:
         REPOSITORY: ${{ github.repository }}
         CTX: ${{ steps.pr.outputs.ctx }}
         TRIGGER: ${{ inputs.trigger }}
-        SKILL: ${{ inputs.skill }}
       run: |
         set -euo pipefail
         DELIM="EOF_$(head -c 8 /dev/urandom | xxd -p)"
@@ -377,17 +250,10 @@ runs:
           echo "You are reviewing pull request #${PR_NUMBER} in repository ${REPOSITORY}."
           echo "Context directory: ${CTX}"
           echo "Trigger: ${TRIGGER}"
-          if [[ -n "$SKILL" ]]; then
-            echo "Skill to run: ${SKILL//\{pr\}/$PR_NUMBER}"
-          fi
           echo "Manifest:"
           cat "$CTX/manifest.json"
           echo
-          if [[ -n "$SKILL" ]]; then
-            cat "$ACTION_PATH/skill-prompt.md"
-          else
-            cat "$ACTION_PATH/prompt.md"
-          fi
+          cat "$ACTION_PATH/prompt.md"
           if [[ -n "$EXTRA_PROMPT" ]]; then
             echo
             echo "## Repository-specific review guidelines"
@@ -422,8 +288,7 @@ runs:
         # Plan comments are authored by apps; the action rejects bot actors unless listed.
         allowed_bots: ${{ inputs.atlantis_bot }},${{ inputs.spacelift_bot }}
         include_fix_links: false
-        # No hooks from any source: the checkout's .claude/ is removed above, but plugins and
-        # skills can declare hooks in several places.
+        # No hooks from any source, on top of removing the checkout's .claude/ above.
         settings: '{"disableAllHooks": true}'
         prompt: ${{ steps.prompt.outputs.content }}
         # Path rules: "/x" anchors at the workspace, "//x" is the filesystem root.
@@ -431,18 +296,16 @@ runs:
           ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
           ${{ inputs.fallback_model && format('--fallback-model {0}', inputs.fallback_model) || '' }}
           --max-budget-usd ${{ inputs.budget }}
-          --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments, edit files or ask questions; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to the allowed commands (gh pr diff, gh pr view, and any the caller added); anything else is denied."
+          --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments, edit files or ask questions; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to gh pr diff and gh pr view; anything else is denied."
           --json-schema '${{ steps.prompt.outputs.schema }}'
           --allowedTools Read Grep Glob
           --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
           --allowedTools "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
-          ${{ steps.tools.outputs.args }}
           --disallowedTools Write Edit NotebookEdit AskUserQuestion WebSearch
           --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(gh pr edit:*)" "Bash(gh pr close:*)" "Bash(gh pr ready:*)"
           --disallowedTools "Bash(gh api:*)" "Bash(gh issue:*)" "Bash(gh release:*)" "Bash(gh workflow:*)" "Bash(gh run:*)" "Bash(gh secret:*)" "Bash(gh variable:*)"
           --disallowedTools "Bash(curl:*)" "Bash(wget:*)" "Bash(git push:*)" "Bash(git remote:*)" "Bash(git config:*)" "Bash(git credential:*)"
           --disallowedTools "Read(/.git/**)"
-          ${{ steps.plugins.outputs.args }}
 
     # Runs after a failure too, so a budget cap or crash still produces a legible result.
     - name: Prepare review
@@ -456,7 +319,6 @@ runs:
         BUDGET: ${{ inputs.budget }}
         MODEL: ${{ inputs.model }}
         TRIGGER: ${{ inputs.trigger }}
-        SKILL: ${{ inputs.skill }}
         MARKER: ${{ inputs.comment_marker }}
         PR_NUMBER: ${{ inputs.pr_number }}
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -508,7 +370,7 @@ runs:
 
         BODY=$(jq -rn --arg note "$NOTE" --arg structured "$STRUCTURED" --arg trigger "$TRIGGER" \
           --arg cost "$COST" --arg turns "$TURNS" --arg secs "$SECS" --arg model "${MODEL:-default}" --arg run "$RUN_URL" \
-          --arg marker "$MARKER" --arg skill "$SKILL" '
+          --arg marker "$MARKER" '
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
@@ -534,7 +396,7 @@ runs:
             "",
             $note,
             "",
-            "<sub>trigger: " + $trigger + (if $skill != "" then " · skill: `" + $skill + "`" else "" end) + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
+            "<sub>trigger: " + $trigger + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
           ] | map(select(. != "")) | join("\n")')
 
         # Commit status semantics: success = a review was produced (findings or not; humans decide
