@@ -101,11 +101,18 @@ jobs:
       (
         github.event.issue.pull_request &&
         (
-          (contains(github.event.comment.body, inputs.trigger_phrase) && github.event.comment.user.type != 'Bot') ||
-          (inputs.mode == 'auto' && github.event.comment.user.login == inputs.atlantis_bot && startsWith(github.event.comment.body, 'Ran Plan')) ||
-          (inputs.mode == 'auto' && github.event.comment.user.login == inputs.spacelift_bot && contains(github.event.comment.body, 'spacelift.io/stack/') && !contains(github.event.comment.body, 'Deploy'))
+          (github.event.action == 'created' && github.event.comment.user.type != 'Bot' &&
+           contains(github.event.comment.body, inputs.trigger_phrase) &&
+           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+          (inputs.mode == 'auto' && startsWith(github.event.comment.body, 'Ran Plan') &&
+           contains(format(',{0},{0}[bot],', inputs.atlantis_bot), format(',{0},', github.event.comment.user.login))) ||
+          (inputs.mode == 'auto' && contains(github.event.comment.body, 'spacelift.io/stack/') &&
+           contains(format(',{0},{0}[bot],', inputs.spacelift_bot), format(',{0},', github.event.comment.user.login)))
         )
       ))
+    # Bot logins are accepted with or without the "[bot]" suffix. Edited comments count only for
+    # bots (Spacelift updates its comments in place); humans trigger by posting a new comment,
+    # and only with write access to the repository (OWNER, MEMBER or COLLABORATOR).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -146,13 +153,18 @@ jobs:
           [[ "$HAS_API_KEY" == "true" ]] || skip "ANTHROPIC_API_KEY secret is not set in this repository."
 
           TRIGGER=""
+          LOGIN="${COMMENT_LOGIN%\[bot\]}"
           case "$EVENT_NAME" in
             issue_comment)
               if [[ "$COMMENT_TYPE" != "Bot" && "$COMMENT_BODY" == *"$TRIGGER_PHRASE"* ]]; then
                 TRIGGER=on-demand
-              elif [[ "$COMMENT_LOGIN" == "$ATLANTIS_BOT" ]]; then
+              elif [[ "$LOGIN" == "${ATLANTIS_BOT%\[bot\]}" ]]; then
                 TRIGGER=atlantis-plan
-              elif [[ "$COMMENT_LOGIN" == "$SPACELIFT_BOT" ]]; then
+              elif [[ "$LOGIN" == "${SPACELIFT_BOT%\[bot\]}" ]]; then
+                # Deploy notifications (posted after merge) are not plans.
+                if [[ "$COMMENT_BODY" =~ ^(:heavy_check_mark:|:x:)\ \*\*Deploy ]]; then
+                  skip "Spacelift comment is a deploy notification."
+                fi
                 TRIGGER=spacelift-plan
               else
                 skip "comment is not a review trigger."
@@ -196,7 +208,8 @@ jobs:
           if [[ -n "$PATHS" || -n "$PATHS_IGNORE" ]]; then
             FILE_LIST=$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename') \
               || skip "could not list the changed files of PR #$PR_NUMBER."
-            mapfile -t FILES <<< "$FILE_LIST"
+            FILES=()
+            [[ -z "$FILE_LIST" ]] || mapfile -t FILES <<< "$FILE_LIST"
             matches_any() {  # $1 = newline-separated globs; true if any changed file matches any glob
               local f g
               while read -r g; do
@@ -267,6 +280,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
           pr_number: ${{ needs.gate.outputs.pr_number }}
           trigger: ${{ needs.gate.outputs.trigger }}
+          trigger_phrase: ${{ inputs.trigger_phrase }}
           atlantis_bot: ${{ inputs.atlantis_bot }}
           spacelift_bot: ${{ inputs.spacelift_bot }}
           helm_diff_artifact: ${{ inputs.helm_diff_artifact }}
@@ -280,8 +294,11 @@ jobs:
   post:
     name: post
     needs: [gate, review]
-    # Runs after a failed review job too (to report it), but not after a superseded one.
-    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' && needs.review.result != 'skipped' }}
+    # Runs after a failed review job too (to report it), but not after a superseded (cancelled)
+    # or skipped one.
+    if: >-
+      ${{ !cancelled() && needs.gate.outputs.skip != 'true' &&
+          needs.review.result != 'skipped' && needs.review.result != 'cancelled' }}
     runs-on: ubuntu-latest
     steps:
       - name: Post review
@@ -314,23 +331,29 @@ jobs:
         run: |
           set -euo pipefail
           SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
-          gh run list --repo "$REPOSITORY" --workflow "$WORKFLOW" --created ">$SINCE" --limit 500 \
-            --json conclusion,status,event > runs.json
-          # In-progress runs have conclusion "" (truthy in jq), hence the explicit fallback.
-          SUMMARY=$(jq -r '
-            def outcome: if (.conclusion // "") == "" then .status else .conclusion end;
-            map(select(.event != "schedule"))
-            | group_by(outcome) | map({k: (.[0] | outcome), n: length})
-            | sort_by(-.n) | map("| \(.k) | \(.n) |") | join("\n")' runs.json)
+          gh run list --repo "$REPOSITORY" --workflow "$WORKFLOW" --created ">$SINCE" --limit 200 \
+            --json databaseId,conclusion,status,event > runs.json
           STARTUP=$(jq '[.[] | select(.conclusion == "startup_failure")] | length' runs.json)
-          FAILED=$(jq '[.[] | select(.event != "schedule" and .conclusion == "failure")] | length' runs.json)
-          OK=$(jq '[.[] | select(.event != "schedule" and .conclusion == "success")] | length' runs.json)
+          # Most runs end at the gate (unrelated comments) and count as success, which would hide
+          # a broken review job. Count the `review` job's own conclusion instead; in a caller it is
+          # named "<caller job> / review".
+          : > jobs.txt
+          while read -r RUN_ID; do
+            gh api --paginate "repos/$REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name | test("(^|/ )review$")) | .conclusion // "in_progress"' >> jobs.txt \
+              || echo "::warning::Could not list jobs of run $RUN_ID."
+          done < <(jq -r '.[] | select(.event != "schedule" and .conclusion != "startup_failure") | .databaseId' runs.json)
+          SUMMARY=$(sort jobs.txt | uniq -c | sort -rn | awk '{printf "| %s | %s |\n", $2, $1}')
+          FAILED=$(grep -c '^failure$' jobs.txt || true)
+          OK=$(grep -c '^success$' jobs.txt || true)
           {
             echo "### Claude review health, last 7 days (\`$WORKFLOW\` in $REPOSITORY)"
             echo
-            echo "| conclusion | runs |"
+            echo "| review job conclusion | runs |"
             echo "|---|---|"
-            echo "${SUMMARY:-| (no runs) | 0 |}"
+            echo "${SUMMARY:-| (no review runs) | 0 |}"
+            echo
+            echo "Workflow runs ending in startup_failure: $STARTUP"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # The claude-code-action ref is resolved inside the composite at job time, so an
@@ -339,12 +362,12 @@ jobs:
           if [[ "$STARTUP" -gt 0 ]]; then
             PROBLEM="$STARTUP run(s) ended in startup_failure: the caller workflow itself is not starting."
           elif [[ "$FAILED" -gt 0 && "$OK" -eq 0 ]]; then
-            PROBLEM="$FAILED failed run(s) and no successful review in 7 days (check the anthropics/claude-code-action ref against the org allowlist)."
+            PROBLEM="$FAILED failed review job(s) and no successful one in 7 days (check the anthropics/claude-code-action ref against the org allowlist)."
           elif [[ "$FAILED" -gt "$OK" ]]; then
-            PROBLEM="$FAILED failed run(s) against $OK successful in 7 days."
+            PROBLEM="$FAILED failed review job(s) against $OK successful in 7 days."
           fi
           if [[ -z "$PROBLEM" ]]; then
-            echo "Healthy: $OK successful review run(s), $FAILED failed, $STARTUP startup failures."
+            echo "Healthy: $OK successful review job(s), $FAILED failed, $STARTUP startup failures."
             exit 0
           fi
           echo "::error::Claude review unhealthy in $REPOSITORY: $PROBLEM"

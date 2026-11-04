@@ -21,13 +21,14 @@ review of application repositories see
 
 ## How it runs
 
-Three jobs:
+Four jobs:
 
 | Job | Token | What it does |
 |---|---|---|
 | `gate` | caller's | Decides whether the event is a review trigger, resolves the PR, refuses forks and closed PRs. Runs in seconds; non-trigger comments never start a runner. When a human asks on a closed PR it replies saying so, instead of silently skipping. |
 | `review` | read-only | Collects plan comments, Spacelift comments, Helm diff, checks and discussion into files, then runs `anthropics/claude-code-action` with `Read`, `Grep`, `Glob`, `gh pr diff` and `gh pr view` only. Claude cannot write to GitHub or the workspace. Returns schema-validated structured output. |
 | `post` | write | Minimizes earlier review comments, posts exactly one new one, optionally sets a commit status. A failed review still produces a comment so a silent run never reads as a clean one. |
+| `health` | caller's | Schedule only. Audits the `review` job's conclusions over the last 7 days and fails (optionally posting to Slack) when reviews are failing or the workflow is not starting. |
 
 The `review` job has a per-PR concurrency group with `cancel-in-progress`, so the newest plan
 comment or request supersedes a running review. Only review triggers reach that job, so an

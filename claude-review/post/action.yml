@@ -82,11 +82,14 @@ runs:
               }
             }
           }' | jq -r --arg marker "$MARKER" \
-            'select(.author.__typename == "Bot" and (.isMinimized | not) and (.body | contains($marker))) | .id' \
+            'select(.author.__typename == "Bot" and (.isMinimized | not)
+                    and ((.body | contains($marker)) or (.body | contains("<!-- claude-tf-plan-review -->")))) | .id' \
           | while read -r id; do
               echo "Minimizing $id"
+              # A comment deleted in between or a transient API error must not lose the review.
               gh api graphql -f id="$id" -f query='mutation($id: ID!) {
-                minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' > /dev/null
+                minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' > /dev/null \
+                || echo "::warning::Could not minimize comment $id."
             done
 
         jq -r .body <<< "$REVIEW" > "$RUNNER_TEMP/claude-review-body.md"

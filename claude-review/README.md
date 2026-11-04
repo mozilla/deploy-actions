@@ -18,6 +18,7 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 | `pr_number`          | Pull request number to review.                                                                                                                                                   | `true`   | ` `                   |
 | `github_token`       | GitHub token with contents:read and pull-requests:read. Nothing in this action writes to GitHub.                                                                                 | `false`  | `${{ github.token }}` |
 | `trigger`            | What started this review: on-demand, atlantis-plan, spacelift-plan, helm-diff or pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.          | `false`  | `on-demand`           |
+| `trigger_phrase`     | Phrase humans use to request a review; such comments are left out of the discussion context.                                                                                     | `false`  | `@claude`             |
 | `atlantis_bot`       | GitHub login of the Atlantis app that posts plan comments.                                                                                                                       | `false`  | `atlantis-admin[bot]` |
 | `spacelift_bot`      | GitHub login of the Spacelift app that posts run comments.                                                                                                                       | `false`  | `spacelift-io[bot]`   |
 | `helm_diff_artifact` | Name of an artifact in this workflow run containing `diff.log` from diff-rendered-charts. When empty, the Helm diff is read from the PR comments instead.                        | `false`  | ` `                   |
@@ -51,8 +52,7 @@ Atlantis and Spacelift comments, the Helm diff (artifact or comment), kubeconfor
 checks and human discussion into `$RUNNER_TEMP/claude-review/`. HTML comments are stripped from
 fetched bodies. The prompt in [`prompt.md`](./prompt.md) treats all of it as untrusted data.
 Repo-level `.claude/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md` are removed from the checkout and
-memory files are not loaded before Claude runs. Claude
-returns structured output matching [`schema.json`](./schema.json); the comment is rendered from
+memory files are not loaded before Claude runs. Claude returns structured output matching [`schema.json`](./schema.json); the comment is rendered from
 that, not from free text.
 
 ## Example Usage

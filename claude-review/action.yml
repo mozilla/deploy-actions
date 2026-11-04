@@ -25,6 +25,10 @@ inputs:
       pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.
     required: false
     default: on-demand
+  trigger_phrase:
+    description: Phrase humans use to request a review; such comments are left out of the discussion context.
+    required: false
+    default: "@claude"
   atlantis_bot:
     description: GitHub login of the Atlantis app that posts plan comments.
     required: false
@@ -163,7 +167,8 @@ runs:
         ATLANTIS=$(strip "$ATLANTIS_BOT")
         SPACELIFT=$(strip "$SPACELIFT_BOT")
 
-        # Hidden HTML comments are a classic injection channel; markers are matched before stripping.
+        # Hidden HTML comments (single or multi-line) are a classic injection channel; markers are
+        # matched before stripping.
         render() {  # $1 = jq filter selecting comments, $2 = output file, $3 = heading
           local n
           n=$(jq "[.[] | select($1)] | length" comments.json)
@@ -171,8 +176,7 @@ runs:
             {
               echo "# $3"
               echo
-              jq -r "[.[] | select($1)][] | \"## \(.author.login // \"ghost\") at \(.createdAt)\n<\(.url)>\n\n\(.body)\n\"" comments.json \
-                | sed -E 's/<!--[^>]*-->//g'
+              jq -r "[.[] | select($1)][] | \"## \(.author.login // \"ghost\") at \(.createdAt)\n<\(.url)>\n\n\(.body | gsub(\"(?s)<!--.*?-->\"; \"\"))\n\"" comments.json
             } > "$2"
           fi
           echo "$n"
@@ -182,7 +186,11 @@ runs:
         SPL_SEL='((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
         HELM_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- helm-diff -->|^Changes found in Helm charts\\.|^Continued from previous comment\\."))'
         KUBE_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- kubeconform-marker -->"))'
-        HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | test("@claude")) | not)'
+        if [[ ! "$TRIGGER_PHRASE" =~ ^[@A-Za-z0-9_./:\ -]+$ ]]; then
+          echo "::error::trigger_phrase '$TRIGGER_PHRASE' contains characters that are not allowed."
+          exit 1
+        fi
+        HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | contains("'"$TRIGGER_PHRASE"'")) | not)'
 
         N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
         N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
@@ -291,21 +299,22 @@ runs:
         # No hooks from any source, on top of removing the checkout's .claude/ above.
         settings: '{"disableAllHooks": true}'
         prompt: ${{ steps.prompt.outputs.content }}
-        # Path rules: "/x" anchors at the workspace, "//x" is the filesystem root.
+        # Path rules: "/x" anchors at the workspace, "//x" is the filesystem root. Read is scoped
+        # rather than bare: /proc/self/environ holds the API key and token, and the runner's
+        # file-command directory holds step outputs. Read rules also govern Grep and Glob.
         claude_args: |
           ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
           ${{ inputs.fallback_model && format('--fallback-model {0}', inputs.fallback_model) || '' }}
           --max-budget-usd ${{ inputs.budget }}
           --append-system-prompt "You are a non-interactive reviewer in CI. You cannot post comments, edit files or ask questions; return structured output only. Read the context directory files first, then the PR diff with gh pr diff. Output over about 30,000 characters is saved to a file; read all of it with offset and limit. Shell access is limited to gh pr diff and gh pr view; anything else is denied."
           --json-schema '${{ steps.prompt.outputs.schema }}'
-          --allowedTools Read Grep Glob
+          --allowedTools Grep Glob "Read(/**)" "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
           --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
-          --allowedTools "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
           --disallowedTools Write Edit NotebookEdit AskUserQuestion WebSearch
           --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(gh pr edit:*)" "Bash(gh pr close:*)" "Bash(gh pr ready:*)"
           --disallowedTools "Bash(gh api:*)" "Bash(gh issue:*)" "Bash(gh release:*)" "Bash(gh workflow:*)" "Bash(gh run:*)" "Bash(gh secret:*)" "Bash(gh variable:*)"
           --disallowedTools "Bash(curl:*)" "Bash(wget:*)" "Bash(git push:*)" "Bash(git remote:*)" "Bash(git config:*)" "Bash(git credential:*)"
-          --disallowedTools "Read(/.git/**)"
+          --disallowedTools "Read(/.git/**)" "Read(//proc/**)" "Read(/${{ runner.temp }}/_runner_file_commands/**)"
 
     # Runs after a failure too, so a budget cap or crash still produces a legible result.
     - name: Prepare review
@@ -320,6 +329,8 @@ runs:
         MODEL: ${{ inputs.model }}
         TRIGGER: ${{ inputs.trigger }}
         MARKER: ${{ inputs.comment_marker }}
+        API_KEY: ${{ inputs.anthropic_api_key }}
+        TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         CTX: ${{ steps.pr.outputs.ctx }}
@@ -355,9 +366,23 @@ runs:
           STRUCTURED=""
         fi
 
+        # Never publish a credential, whatever prompt injection asked for: the exact values this
+        # job holds, and anything shaped like an Anthropic or GitHub token.
+        LEAK=false
+        if [[ -n "$STRUCTURED" ]]; then
+          [[ -n "$API_KEY" && "$STRUCTURED" == *"$API_KEY"* ]] && LEAK=true
+          [[ -n "$TOKEN" && "$STRUCTURED" == *"$TOKEN"* ]] && LEAK=true
+          grep -Eq 'sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}' <<< "$STRUCTURED" && LEAK=true
+        fi
+
         ERROR=""
         NOTE=""
-        if [[ -z "$STRUCTURED" ]]; then
+        if [[ "$LEAK" == true ]]; then
+          echo "::error::Review output contained a credential-like string; discarded."
+          STRUCTURED=""
+          NOTE="> [!CAUTION]"$'\n'"> The review output contained a credential-like string and was discarded. Check the PR for prompt injection. See the [run log]($RUN_URL)."
+          ERROR="Review output contained a credential-like string."
+        elif [[ -z "$STRUCTURED" ]]; then
           if [[ "$SUBTYPE" == error_max_budget* ]]; then
             NOTE="> [!WARNING]"$'\n'"> Claude hit the \$$BUDGET budget cap before finishing. No review was produced."
           else
@@ -374,30 +399,24 @@ runs:
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
-          [ "<!-- " + $marker + " -->",
-            "### Claude review: " + (if $r == null then "no review produced" else $r.verdict end),
-            "",
-            (if $r == null then "" else
+          # One entry per section; null sections are dropped and the rest are separated by blank lines.
+          [ "<!-- " + $marker + " -->\n### Claude review: " + (if $r == null then "no review produced" else $r.verdict end),
+            (if $r == null then null else
               "**Status:** " + $r.status
               + "  |  **Reviewed:** " + (if ($r.sources_reviewed | length) > 0 then ($r.sources_reviewed | join(", ")) else "nothing" end)
               + (if ($r.sources_missing | length) > 0 then "  |  **Missing:** " + ($r.sources_missing | join(", ")) else "" end)
             end),
-            "",
-            (if $r == null or (($r.summary_markdown // "") == "") then "" else $r.summary_markdown end),
-            "",
-            (if $r == null then "" elif ($r.findings | length) == 0 then "_No findings._" else
+            (if $r == null or (($r.summary_markdown // "") == "") then null else $r.summary_markdown end),
+            (if $r == null then null elif ($r.findings | length) == 0 then "_No findings._" else
               "#### Findings\n" + ($r.findings | map(
                 "- **" + (.severity | sev) + "** · `" + .source + "` · **" + .title + "**\n  " + (.detail | gsub("\n"; "\n  "))
                 + (if (.references // [] | length) > 0 then "\n  " + (.references | map("`" + . + "`") | join(", ")) else "" end)
               ) | join("\n")) end),
-            "",
-            (if $r == null or (($r.apply_readiness // []) | length) == 0 then "" else
+            (if $r == null or (($r.apply_readiness // []) | length) == 0 then null else
               "#### Apply readiness\n" + list($r.apply_readiness; "") end),
-            "",
-            $note,
-            "",
+            (if $note == "" then null else $note end),
             "<sub>trigger: " + $trigger + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
-          ] | map(select(. != "")) | join("\n")')
+          ] | map(select(. != null)) | join("\n\n")')
 
         # Commit status semantics: success = a review was produced (findings or not; humans decide
         # what blocks), failure = no review could be produced. Making the status required then

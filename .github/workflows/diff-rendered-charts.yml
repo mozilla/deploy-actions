@@ -173,13 +173,18 @@ jobs:
               const body = comment.body ?? "";
               const isOurs = body.includes(marker) || legacyHeaders.some(h => body.startsWith(h));
               if (isOurs && comment.user.type === "Bot") {
-                await github.graphql(`
-                  mutation MinimizeComment($subjectId: ID!) {
-                    minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
-                      minimizedComment { isMinimized }
+                try {
+                  await github.graphql(`
+                    mutation MinimizeComment($subjectId: ID!) {
+                      minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
+                        minimizedComment { isMinimized }
+                      }
                     }
-                  }
-                `, { subjectId: comment.node_id });
+                  `, { subjectId: comment.node_id });
+                } catch (error) {
+                  // A comment deleted in between must not stop the new diff from being posted.
+                  core.warning(`Could not minimize comment ${comment.id}: ${error.message}`);
+                }
               }
             }
 
