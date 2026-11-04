@@ -26,9 +26,9 @@ Four jobs:
 | Job | Token | What it does |
 |---|---|---|
 | `gate` | caller's | Decides whether the event is a review trigger, resolves the PR, refuses forks and closed PRs. Runs in seconds; non-trigger comments never start a runner. When a human asks on a closed PR it replies saying so, instead of silently skipping. |
-| `review` | read-only | Collects plan comments, Spacelift comments, Helm diff, checks and discussion into files, then runs `anthropics/claude-code-action` with `Read`, `Grep`, `Glob`, `gh pr diff` and `gh pr view` only. Claude cannot write to GitHub or the workspace. Returns schema-validated structured output. |
+| `review` | read-only (+ `checks`, `statuses`) | Collects plan comments, Spacelift comments, Helm diff, checks and discussion into files, then runs `anthropics/claude-code-action` with `Read`, `Grep`, `Glob`, `gh pr diff` and `gh pr view` only. Claude cannot write to GitHub or the workspace. Returns schema-validated structured output. |
 | `post` | write | Minimizes earlier review comments, posts exactly one new one, optionally sets a commit status. A failed review still produces a comment so a silent run never reads as a clean one. |
-| `health` | caller's | Schedule only. Audits the `review` job's conclusions over the last 7 days and fails (optionally posting to Slack) when reviews are failing or the workflow is not starting. |
+| `health` | caller's | Schedule only. Audits the `post` job's conclusions over the last 7 days (it fails whenever no review was produced) and fails (optionally posting to Slack) when reviews are failing or the workflow is not starting. |
 
 The `review` job has a per-PR concurrency group with `cancel-in-progress`, so the newest plan
 comment or request supersedes a running review. Only review triggers reach that job, so an
@@ -41,7 +41,7 @@ Triggers, by caller event:
 | `issue_comment` | A human with write access (owner, member or collaborator) posts a comment containing the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts or edits a run comment. Subscribe to `created` and `edited`; edits by humans are ignored, and so are the `edited` events Atlantis raises when it minimizes its previous plan comments |
 | `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored PRs are skipped here but still get plan-triggered reviews |
 | `workflow_dispatch` | Pass `pr_number` |
-| `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every `review` job failed, or when failed `review` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
+| `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every review produced nothing, or when failed `post` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
 
 If the `ANTHROPIC_API_KEY` secret is empty the gate skips with a notice, so a repository can adopt
 the caller before the secret exists without PR noise.
@@ -68,7 +68,8 @@ Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health c
 
 ## Permissions
 
-The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`;
+The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`,
+`checks: read`, `statuses: read` (the last two let it read Atlantis plan statuses and CI results);
 the `post` and `health` jobs inherit the caller's grant. GitHub validates every called job's
 declared permissions against the caller's grant at startup, including jobs that `if:` skips, which
 is why only the minimum is declared inside. Callers must grant at least:
@@ -77,8 +78,9 @@ is why only the minimum is declared inside. Callers must grant at least:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
+  statuses: read    # statuses: write with post_status: true
   actions: read     # with a schedule trigger (health check)
-  statuses: write   # with post_status: true
 ```
 
 Humans who comment the trigger phrase need write access to the repository; the action refuses
@@ -111,6 +113,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      checks: read
+      statuses: read
       actions: read
     with:
       atlantis_bot: ${{ vars.ATLANTIS_GITHUB_USER }}
@@ -137,6 +141,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      checks: read
+      statuses: read
     with:
       helm_diff_artifact: ${{ needs.diff.outputs.diff_artifact }}
     secrets:
@@ -152,7 +158,7 @@ check out the PR head before the review step:
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions: { contents: read, pull-requests: read }
+    permissions: { contents: read, pull-requests: read, checks: read, statuses: read }
     outputs: { review: ${{ steps.review.outputs.review }} }
     steps:
       - uses: actions/checkout@<sha>
@@ -215,7 +221,7 @@ pin lives in this repository alone, with a Dependabot ignore rule. Callers refer
 - **"No review produced".** Usually the budget cap. Raise `budget_usd` or narrow `extra_prompt`.
 - **Every review fails with "no review produced".** Most likely the `anthropics/claude-code-action`
   ref is no longer `@v1` or the org allowlist changed; because the action is resolved inside the
-  composite, this shows as a failed `review` job rather than `startup_failure`. Fix it here once;
+  composite, this shows as a failed `post` job rather than `startup_failure`. Fix it here once;
   every caller recovers. The scheduled health check reports it as "failed runs and no successful
   review".
 - **Spacelift plans not reviewed.** The Spacelift notification policy must post run comments on

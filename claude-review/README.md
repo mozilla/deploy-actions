@@ -12,22 +12,22 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 ## Inputs
 
 <!--inputs-->
-| Name                 | Description                                                                                                                                                                      | Required | Default               |
-|----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|-----------------------|
-| `anthropic_api_key`  | Anthropic API key.                                                                                                                                                               | `true`   | ` `                   |
-| `pr_number`          | Pull request number to review.                                                                                                                                                   | `true`   | ` `                   |
-| `github_token`       | GitHub token with contents:read and pull-requests:read. Nothing in this action writes to GitHub.                                                                                 | `false`  | `${{ github.token }}` |
-| `trigger`            | What started this review: on-demand, atlantis-plan, spacelift-plan, helm-diff or pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.          | `false`  | `on-demand`           |
-| `trigger_phrase`     | Phrase humans use to request a review; such comments are left out of the discussion context.                                                                                     | `false`  | `@claude`             |
-| `atlantis_bot`       | GitHub login of the Atlantis app that posts plan comments.                                                                                                                       | `false`  | `atlantis-admin[bot]` |
-| `spacelift_bot`      | GitHub login of the Spacelift app that posts run comments.                                                                                                                       | `false`  | `spacelift-io[bot]`   |
-| `helm_diff_artifact` | Name of an artifact in this workflow run containing `diff.log` from diff-rendered-charts. When empty, the Helm diff is read from the PR comments instead.                        | `false`  | ` `                   |
-| `extra_prompt`       | Repository-specific review instructions appended to the base prompt.                                                                                                             | `false`  | ` `                   |
-| `model`              | Claude model. Empty uses the claude-code-action default.                                                                                                                         | `false`  | ` `                   |
-| `fallback_model`     | Fallback model if the primary is unavailable. Empty uses the default.                                                                                                            | `false`  | ` `                   |
-| `budget`             | Maximum spend per review in USD.                                                                                                                                                 | `false`  | `6.00`                |
-| `debounce_seconds`   | Seconds to wait before collecting context when triggered by a plan comment.                                                                                                      | `false`  | `45`                  |
-| `comment_marker`     | Identifier embedded as `<!-- <marker> -->` in the posted comment. Callers running several reviews on one repository give each its own marker so they do not collapse each other. | `false`  | `claude-review`       |
+| Name                 | Description                                                                                                                                                                                          | Required | Default               |
+|----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|-----------------------|
+| `anthropic_api_key`  | Anthropic API key.                                                                                                                                                                                   | `true`   | ` `                   |
+| `pr_number`          | Pull request number to review.                                                                                                                                                                       | `true`   | ` `                   |
+| `github_token`       | GitHub token with contents:read, pull-requests:read, checks:read and statuses:read (the last two are optional; without them CI statuses are not collected). Nothing in this action writes to GitHub. | `false`  | `${{ github.token }}` |
+| `trigger`            | What started this review: on-demand, atlantis-plan, spacelift-plan, helm-diff or pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.                              | `false`  | `on-demand`           |
+| `trigger_phrase`     | Phrase humans use to request a review; such comments are left out of the discussion context.                                                                                                         | `false`  | `@claude`             |
+| `atlantis_bot`       | GitHub login of the Atlantis app that posts plan comments.                                                                                                                                           | `false`  | `atlantis-admin[bot]` |
+| `spacelift_bot`      | GitHub login of the Spacelift app that posts run comments.                                                                                                                                           | `false`  | `spacelift-io[bot]`   |
+| `helm_diff_artifact` | Name of an artifact in this workflow run containing `diff.log` from diff-rendered-charts. When empty, the Helm diff is read from the PR comments instead.                                            | `false`  | ` `                   |
+| `extra_prompt`       | Repository-specific review instructions appended to the base prompt.                                                                                                                                 | `false`  | ` `                   |
+| `model`              | Claude model. Empty uses the claude-code-action default.                                                                                                                                             | `false`  | ` `                   |
+| `fallback_model`     | Fallback model if the primary is unavailable. Empty uses the default.                                                                                                                                | `false`  | ` `                   |
+| `budget`             | Maximum spend per review in USD.                                                                                                                                                                     | `false`  | `6.00`                |
+| `debounce_seconds`   | Seconds to wait before collecting context when triggered by a plan comment.                                                                                                                          | `false`  | `45`                  |
+| `comment_marker`     | Identifier embedded as `<!-- <marker> -->` in the posted comment. Callers running several reviews on one repository give each its own marker so they do not collapse each other.                     | `false`  | `claude-review`       |
 <!--/inputs-->
 
 ## Outputs
@@ -41,7 +41,8 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 ## Requirements
 
 - Check out the pull request head into the workspace before this step.
-- Run it in a job whose token is read-only (`contents: read`, `pull-requests: read`).
+- Run it in a job whose token is read-only (`contents: read`, `pull-requests: read`, plus
+  `checks: read` and `statuses: read` for CI context).
 - Pass the `review` output to [`claude-review/post`](./post/README.md) in a separate job with
   `pull-requests: write`.
 

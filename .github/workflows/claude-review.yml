@@ -263,10 +263,13 @@ jobs:
     concurrency:
       group: ${{ inputs.comment_marker }}-${{ github.repository }}-${{ needs.gate.outputs.pr_number }}
       cancel-in-progress: true
-    # Read-only: a token Claude could read is worth little.
+    # Read-only: a token Claude could read is worth little. checks/statuses let the collect step
+    # read Atlantis `atlantis/plan:<project>` statuses and CI results; callers must grant both.
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+      statuses: read
     outputs:
       review: ${{ steps.review.outputs.review }}
     steps:
@@ -341,12 +344,14 @@ jobs:
             --json databaseId,conclusion,status,event > runs.json
           STARTUP=$(jq '[.[] | select(.conclusion == "startup_failure")] | length' runs.json)
           # Most runs end at the gate (unrelated comments) and count as success, which would hide
-          # a broken review job. Count the `review` job's own conclusion instead; in a caller it is
-          # named "<caller job> / review".
+          # a broken review job, and the `review` job itself stays green when Claude fails because
+          # the action step has continue-on-error. The `post` job fails whenever no review was
+          # produced, so count that; in a caller it is named "<caller job> / post". Gate-only runs
+          # skip it and are not counted.
           : > jobs.txt
           while read -r RUN_ID; do
             gh api --paginate "repos/$REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name | test("(^|/ )review$")) | .conclusion // "in_progress"' >> jobs.txt \
+              --jq '.jobs[] | select(.name | test("(^|/ )post$")) | .conclusion // "in_progress"' >> jobs.txt \
               || echo "::warning::Could not list jobs of run $RUN_ID."
           done < <(jq -r '.[] | select(.event != "schedule" and .conclusion != "startup_failure") | .databaseId' runs.json)
           SUMMARY=$(sort jobs.txt | uniq -c | sort -rn | awk '{printf "| %s | %s |\n", $2, $1}')
@@ -355,7 +360,7 @@ jobs:
           {
             echo "### Claude review health, last 7 days (\`$WORKFLOW\` in $REPOSITORY)"
             echo
-            echo "| review job conclusion | runs |"
+            echo "| post job conclusion | runs |"
             echo "|---|---|"
             echo "${SUMMARY:-| (no review runs) | 0 |}"
             echo
@@ -363,12 +368,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # The claude-code-action ref is resolved inside the composite at job time, so an
-          # allowlist break shows up as review-job failures, not startup_failure. Both are covered.
+          # allowlist break shows up as failed post jobs, not startup_failure. Both are covered.
           PROBLEM=""
           if [[ "$STARTUP" -gt 0 ]]; then
             PROBLEM="$STARTUP run(s) ended in startup_failure: the caller workflow itself is not starting."
           elif [[ "$FAILED" -gt 0 && "$OK" -eq 0 ]]; then
-            PROBLEM="$FAILED failed review job(s) and no successful one in 7 days (check the anthropics/claude-code-action ref against the org allowlist)."
+            PROBLEM="$FAILED review(s) produced nothing and none succeeded in 7 days (check the anthropics/claude-code-action ref against the org allowlist)."
           elif [[ "$FAILED" -gt "$OK" ]]; then
             PROBLEM="$FAILED failed review job(s) against $OK successful in 7 days."
           fi

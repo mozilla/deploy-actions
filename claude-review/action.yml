@@ -16,7 +16,7 @@ inputs:
     description: Pull request number to review.
     required: true
   github_token:
-    description: GitHub token with contents:read and pull-requests:read. Nothing in this action writes to GitHub.
+    description: GitHub token with contents:read, pull-requests:read, checks:read and statuses:read (the last two are optional; without them CI statuses are not collected). Nothing in this action writes to GitHub.
     required: false
     default: ${{ github.token }}
   trigger:
