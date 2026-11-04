@@ -213,10 +213,20 @@ runs:
         fi
 
         # Statuses and check runs carry the Atlantis plan summary, lock state and CI results.
-        # Permissions may not allow this; it is optional context.
-        CHECKS="available"
-        gh pr checks "$PR_NUMBER" --repo "$REPOSITORY" --json name,state,description,link > checks.json 2>/dev/null \
-          || { rm -f checks.json; CHECKS="unavailable"; echo "::notice::Could not read checks for #$PR_NUMBER (the token needs checks: read and statuses: read)."; }
+        # Permissions may not allow this; it is optional context. `gh pr checks` exits 8 when any
+        # check is still pending, which is always the case here (this run is one of them).
+        set +e
+        gh pr checks "$PR_NUMBER" --repo "$REPOSITORY" --json name,state,description,link > checks.json 2> checks.err
+        RC=$?
+        set -e
+        if [[ ($RC -eq 0 || $RC -eq 8) ]] && jq -e 'type == "array"' checks.json > /dev/null 2>&1; then
+          CHECKS="available"
+        else
+          CHECKS="unavailable"
+          echo "::notice::Could not read checks for #$PR_NUMBER (gh exit $RC: $(head -c 300 checks.err | tr '\n' ' ')). The token needs checks: read and statuses: read."
+          rm -f checks.json
+        fi
+        rm -f checks.err
 
         rm -f comments.json
         jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" --arg checks "$CHECKS" \
