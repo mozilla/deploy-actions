@@ -88,6 +88,9 @@ others, and that run posts a "no review produced" comment.
 
 ### Plan-triggered and on-demand reviews (Atlantis / Spacelift repos)
 
+The examples use `@main` for brevity. Real callers should pin a release tag (`vX.Y.Z`); this
+workflow is not part of v6.8.0 or earlier.
+
 ```yaml
 # .github/workflows/claude-review.yaml
 name: Claude Review
@@ -104,7 +107,7 @@ on:
 
 jobs:
   claude-review:
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@main
     permissions:
       contents: read
       pull-requests: write
@@ -122,7 +125,7 @@ Add a job to the workflow that calls `diff-rendered-charts`:
 ```yaml
 jobs:
   diff:
-    uses: mozilla/deploy-actions/.github/workflows/diff-rendered-charts.yml@v6.8.0
+    uses: mozilla/deploy-actions/.github/workflows/diff-rendered-charts.yml@main
     permissions:
       contents: read
       pull-requests: write
@@ -130,7 +133,7 @@ jobs:
   claude-review:
     needs: diff
     if: needs.diff.outputs.changes_found == 'true'
-    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@v6.8.0
+    uses: mozilla/deploy-actions/.github/workflows/claude-review.yml@main
     permissions:
       contents: read
       pull-requests: write
