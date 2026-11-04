@@ -214,17 +214,18 @@ runs:
 
         # Statuses and check runs carry the Atlantis plan summary, lock state and CI results.
         # Permissions may not allow this; it is optional context.
+        CHECKS="available"
         gh pr checks "$PR_NUMBER" --repo "$REPOSITORY" --json name,state,description,link > checks.json 2>/dev/null \
-          || { echo '[]' > checks.json; echo "::notice::Could not read checks for #$PR_NUMBER (missing permission?)."; }
+          || { rm -f checks.json; CHECKS="unavailable"; echo "::notice::Could not read checks for #$PR_NUMBER (the token needs checks: read and statuses: read)."; }
 
         rm -f comments.json
-        jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" \
+        jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" --arg checks "$CHECKS" \
           --argjson atl "$N_ATL" --argjson atl_stale "$ATL_STALE" --argjson spl "$N_SPL" \
           --argjson kube "$N_KUBE" --argjson human "$N_HUMAN" \
           '{trigger: $trigger, head_sha: $head,
             sources: {atlantis_comments: $atl, atlantis_plan_stale_or_locked: $atl_stale,
                       spacelift_comments: $spl, helm_diff: $helm, validation_comments: $kube,
-                      human_comments: $human}}' > manifest.json
+                      checks: $checks, human_comments: $human}}' > manifest.json
         echo "Context collected:"; cat manifest.json
         ls -la "$CTX"
 
@@ -354,7 +355,7 @@ runs:
         if [[ -n "$LOG" && -f "$LOG" ]]; then
           RESULT=$(jq 'map(select(.type == "result")) | last // {}' "$LOG" 2>/dev/null || echo '{}')
         fi
-        eval "$(jq -r '@sh "COST=\(.total_cost_usd // "?") TURNS=\(.num_turns // "?")
+        eval "$(jq -r '@sh "COST=\(if .total_cost_usd then (.total_cost_usd * 1000 | round / 1000) else "?" end) TURNS=\(.num_turns // "?")
           SECS=\(if .duration_ms then .duration_ms / 1000 | round else "?" end)
           SUBTYPE=\(.subtype // "") DENIALS=\(.permission_denials // [] | length)"' <<< "$RESULT")"
         if [[ "$SUBTYPE" == error_max_budget* ]]; then

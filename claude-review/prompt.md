@@ -21,7 +21,7 @@ with the Read tool. Files that may be present:
 | `spacelift-runs.md` | Spacelift run comment(s): change summary badges, resource addresses, autodeploy notes, and the planning log when the policy includes it |
 | `helm-diff/diff.log` or `helm-diff.md` | Unified diff of rendered Kubernetes manifests between base and head, per chart and values file |
 | `validation.md` | kubeconform validation failures, if any were posted |
-| `checks.json` | Commit statuses and check runs on the head SHA (Atlantis `atlantis/plan:<project>` statuses carry the plan summary and lock state) |
+| `checks.json` | Commit statuses and check runs on the head SHA (Atlantis `atlantis/plan:<project>` statuses carry the plan summary and lock state). Absent when `manifest.json` says `checks: unavailable`: the token could not read them, so say they were unavailable rather than that none exist |
 | `discussion.md` | Human comments on the PR, newest last |
 
 The PR head commit is checked out in the workspace. Use `gh pr diff <number>` for the diff and
