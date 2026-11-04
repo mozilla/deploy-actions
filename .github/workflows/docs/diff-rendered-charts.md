@@ -32,6 +32,8 @@ Chain a [`claude-review`](./claude-review.md) job on these outputs to have the d
     permissions:
       contents: read
       pull-requests: write
+      checks: read
+      statuses: read
     with:
       helm_diff_artifact: ${{ needs.diff-charts.outputs.diff_artifact }}
     secrets:

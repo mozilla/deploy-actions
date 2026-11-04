@@ -183,15 +183,15 @@ runs:
           echo "$n"
         }
 
-        ATL_SEL='((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$ATLANTIS"'" and (.body | test("^Ran (Plan|Apply)|^Continued (plan|apply) output|Locks and plans deleted|currently locked|No changes. Your infrastructure|plan failed|Plan Error"; "i"))'
-        SPL_SEL='((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
+        ATL_SEL='((.author.__typename // "") == "Bot") and ((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$ATLANTIS"'" and (.body | test("^Ran (Plan|Apply)|^Continued (plan|apply) output|Locks and plans deleted|currently locked|No changes. Your infrastructure|plan failed|Plan Error"; "i"))'
+        SPL_SEL='((.author.__typename // "") == "Bot") and ((.author.login // "") | sub("\\[bot\\]$"; "")) == "'"$SPACELIFT"'" and (.body | test("spacelift.io/stack/"))'
         HELM_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- helm-diff -->|^Changes found in Helm charts\\.|^Continued from previous comment\\."))'
         KUBE_SEL='((.author.__typename // "") == "Bot") and (.body | test("<!-- kubeconform-marker -->"))'
         if [[ ! "$TRIGGER_PHRASE" =~ ^[@A-Za-z0-9_./:\ -]+$ ]]; then
           echo "::error::trigger_phrase '$TRIGGER_PHRASE' contains characters that are not allowed."
           exit 1
         fi
-        HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | contains("'"$TRIGGER_PHRASE"'")) | not)'
+        HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | ascii_downcase | contains("'"${TRIGGER_PHRASE,,}"'")) | not)'
 
         N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
         N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
@@ -333,7 +333,7 @@ runs:
           --json-schema '${{ steps.prompt.outputs.schema }}'
           --allowedTools Grep Glob "Read(/**)" "Read(/${{ runner.temp }}/claude-review/**)" "Read(~/.claude/**)"
           --allowedTools "Bash(gh pr diff:*)" "Bash(gh pr view:*)"
-          --disallowedTools Write Edit NotebookEdit AskUserQuestion WebSearch
+          --disallowedTools Write Edit NotebookEdit AskUserQuestion WebSearch WebFetch
           --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(gh pr edit:*)" "Bash(gh pr close:*)" "Bash(gh pr ready:*)"
           --disallowedTools "Bash(gh api:*)" "Bash(gh issue:*)" "Bash(gh release:*)" "Bash(gh workflow:*)" "Bash(gh run:*)" "Bash(gh secret:*)" "Bash(gh variable:*)"
           --disallowedTools "Bash(curl:*)" "Bash(wget:*)" "Bash(git push:*)" "Bash(git remote:*)" "Bash(git config:*)" "Bash(git credential:*)"
@@ -408,6 +408,7 @@ runs:
         elif [[ -z "$STRUCTURED" ]]; then
           if [[ "$SUBTYPE" == error_max_budget* ]]; then
             NOTE="> [!WARNING]"$'\n'"> Claude hit the \$$BUDGET budget cap before finishing. No review was produced."
+            ERROR="Claude hit the \$$BUDGET budget cap; no review was produced."
           else
             NOTE="> [!WARNING]"$'\n'"> Claude returned no review (step outcome: \`$OUTCOME\`). See the [run log]($RUN_URL)."
             ERROR="Claude review produced no output."
@@ -421,19 +422,25 @@ runs:
           --arg marker "$MARKER" '
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
-          def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + .) | join("\n")) end;
+          # Model text is posted by a bot with the write token: keep @mentions from notifying
+          # anyone and turn images (remote fetch on render) into plain links.
+          def safe: (. // "" | tostring)
+            | gsub("(?<![`A-Za-z0-9_])@(?<n>[A-Za-z0-9][A-Za-z0-9-]*(/[A-Za-z0-9._-]+)?)"; "`@\(.n)`")
+            | gsub("!\\[(?<a>[^\\]]*)\\]\\((?<u>[^)]*)\\)"; "[\(.a)](\(.u))")
+            | gsub("<(?<t>img|picture|source|video|audio|iframe)\\b"; "&lt;\(.t)"; "i");
+          def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + safe) | join("\n")) end;
           # One entry per section; null sections are dropped and the rest are separated by blank lines.
-          [ "<!-- " + $marker + " -->\n### Claude review: " + (if $r == null then "no review produced" else $r.verdict end),
+          [ "<!-- " + $marker + " -->\n### Claude review: " + (if $r == null then "no review produced" else ($r.verdict | safe) end),
             (if $r == null then null else
-              "**Status:** " + $r.status
-              + "  |  **Reviewed:** " + (if ($r.sources_reviewed | length) > 0 then ($r.sources_reviewed | join(", ")) else "nothing" end)
-              + (if ($r.sources_missing | length) > 0 then "  |  **Missing:** " + ($r.sources_missing | join(", ")) else "" end)
+              "**Status:** " + ($r.status | safe)
+              + "  |  **Reviewed:** " + (if (($r.sources_reviewed // []) | length) > 0 then ($r.sources_reviewed | map(safe) | join(", ")) else "nothing" end)
+              + (if (($r.sources_missing // []) | length) > 0 then "  |  **Missing:** " + ($r.sources_missing | map(safe) | join(", ")) else "" end)
             end),
-            (if $r == null or (($r.summary_markdown // "") == "") then null else $r.summary_markdown end),
+            (if $r == null or (($r.summary_markdown // "") == "") then null else ($r.summary_markdown | safe) end),
             (if $r == null then null elif ($r.findings | length) == 0 then "_No findings._" else
               "#### Findings\n" + ($r.findings | map(
-                "- **" + (.severity | sev) + "** · `" + .source + "` · **" + .title + "**\n  " + (.detail | gsub("\n"; "\n  "))
-                + (if (.references // [] | length) > 0 then "\n  " + (.references | map("`" + . + "`") | join(", ")) else "" end)
+                "- **" + ((.severity // "low") | sev) + "** · `" + ((.source // "code") | safe) + "` · **" + (.title | safe) + "**\n  " + (.detail | safe | gsub("\n"; "\n  "))
+                + (if ((.references // []) | length) > 0 then "\n  " + (.references | map("`" + (safe | gsub("`"; "'")) + "`") | join(", ")) else "" end)
               ) | join("\n")) end),
             (if $r == null or (($r.apply_readiness // []) | length) == 0 then null else
               "#### Apply readiness\n" + list($r.apply_readiness; "") end),

@@ -20,7 +20,7 @@ Posts the review produced by claude-review as one PR comment (minimizing earlier
 
 ## Behaviour
 
-- Earlier comments containing `<!-- claude-review -->` from bot accounts are minimized as outdated.
+- Earlier comments containing `<!-- <comment_marker> -->` (or the legacy `<!-- claude-tf-plan-review -->`) from bot accounts are minimized as outdated.
 - Exactly one comment is posted per run. When the review job produced nothing, the comment says
   so and the step fails, so a silent review never reads as a clean one.
 - Bodies over GitHub's limit are truncated with a link to the run.

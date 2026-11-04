@@ -54,7 +54,8 @@ checks and human discussion into `$RUNNER_TEMP/claude-review/`. HTML comments ar
 fetched bodies. The prompt in [`prompt.md`](./prompt.md) treats all of it as untrusted data.
 Repo-level `.claude/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md` are removed from the checkout and
 memory files are not loaded before Claude runs. Claude returns structured output matching [`schema.json`](./schema.json); the comment is rendered from
-that, not from free text.
+that, not from free text, with `@mentions` neutralized and images turned into plain links so an
+injected review cannot notify people or trigger remote fetches.
 
 ## Example Usage
 

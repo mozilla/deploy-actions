@@ -25,7 +25,7 @@ Four jobs:
 
 | Job | Token | What it does |
 |---|---|---|
-| `gate` | caller's | Decides whether the event is a review trigger, resolves the PR, refuses forks and closed PRs. Runs in seconds; non-trigger comments never start a runner. When a human asks on a closed PR it replies saying so, instead of silently skipping. |
+| `gate` | read + `pull-requests: write` | Decides whether the event is a review trigger, resolves the PR, refuses forks and closed PRs. Runs in seconds; non-trigger comments never start a runner. When a human asks on a closed PR it replies saying so, instead of silently skipping. |
 | `review` | read-only (+ `checks`, `statuses`) | Collects plan comments, Spacelift comments, Helm diff, checks and discussion into files, then runs `anthropics/claude-code-action` with `Read`, `Grep`, `Glob`, `gh pr diff` and `gh pr view` only. Claude cannot write to GitHub or the workspace. Returns schema-validated structured output. |
 | `post` | write | Minimizes earlier review comments, posts exactly one new one, optionally sets a commit status. A failed review still produces a comment so a silent run never reads as a clean one. |
 | `health` | caller's | Schedule only. Audits the `post` job's conclusions over the last 7 days (it fails whenever no review was produced) and fails (optionally posting to Slack) when reviews are failing or the workflow is not starting. |
@@ -39,7 +39,7 @@ Triggers, by caller event:
 | Caller event | When the review runs |
 |---|---|
 | `issue_comment` | A human with write access (owner, member or collaborator) posts a comment containing the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts or edits a run comment. Subscribe to `created` and `edited`; edits by humans are ignored, and so are the `edited` events Atlantis raises when it minimizes its previous plan comments |
-| `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored PRs are skipped here but still get plan-triggered reviews |
+| `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored and draft PRs are skipped here but still get plan-triggered reviews |
 | `workflow_dispatch` | Pass `pr_number` |
 | `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every review produced nothing, or when failed `post` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
 
@@ -50,7 +50,7 @@ the caller before the secret exists without PR noise.
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `mode` | string | `auto` | `auto` reviews on plan comments and the trigger phrase; `on-demand` only on the trigger phrase |
+| `mode` | string | `auto` | `auto` reviews on plan comments and the trigger phrase; `on-demand` only on the trigger phrase. Neither affects `pull_request` or `workflow_dispatch` callers |
 | `trigger_phrase` | string | `@claude` | Comment text from a human that requests a review |
 | `atlantis_bot` | string | `atlantis-admin[bot]` | Login of the Atlantis GitHub App in this repo (`vars.ATLANTIS_GITHUB_USER` where defined) |
 | `spacelift_bot` | string | `spacelift-io[bot]` | Login of the Spacelift GitHub App |
@@ -70,7 +70,8 @@ Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health c
 
 The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`,
 `checks: read`, `statuses: read` (the last two let it read Atlantis plan statuses and CI results);
-the `post` and `health` jobs inherit the caller's grant. GitHub validates every called job's
+the `gate` job declares `contents: read`, `pull-requests: write` (for its closed-PR reply); the
+`post` and `health` jobs inherit the caller's grant. GitHub validates every called job's
 declared permissions against the caller's grant at startup, including jobs that `if:` skips, which
 is why only the minimum is declared inside. Callers must grant at least:
 
@@ -83,8 +84,9 @@ permissions:
   actions: read     # with a schedule trigger (health check)
 ```
 
-Humans who comment the trigger phrase need write access to the repository; the action refuses
-others, and that run posts a "no review produced" comment.
+Humans who comment the trigger phrase must be a repository owner, member or collaborator (the
+`author_association` GitHub reports). Comments from anyone else are not a trigger: no job runs
+and nothing is posted.
 
 ## Usage
 
@@ -222,8 +224,8 @@ pin lives in this repository alone, with a Dependabot ignore rule. Callers refer
 - **Every review fails with "no review produced".** Most likely the `anthropics/claude-code-action`
   ref is no longer `@v1` or the org allowlist changed; because the action is resolved inside the
   composite, this shows as a failed `post` job rather than `startup_failure`. Fix it here once;
-  every caller recovers. The scheduled health check reports it as "failed runs and no successful
-  review".
+  every caller recovers. The scheduled health check reports it as reviews that "produced nothing
+  and none succeeded".
 - **Spacelift plans not reviewed.** The Spacelift notification policy must post run comments on
   the PR (see `spacelift/tf/root/policies/notification/` in global-platform-admin); the review
   reads comments, it does not call the Spacelift API.

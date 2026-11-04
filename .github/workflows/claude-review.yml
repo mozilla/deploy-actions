@@ -17,7 +17,8 @@ on:
       mode:
         description: >-
           "auto" reviews when Atlantis or Spacelift post a plan comment and on the trigger phrase;
-          "on-demand" only reviews on the trigger phrase.
+          "on-demand" only reviews on the trigger phrase. Neither affects pull_request or
+          workflow_dispatch callers, which review whenever they run.
         type: string
         default: auto
       trigger_phrase:
@@ -104,14 +105,16 @@ jobs:
           (github.event.action == 'created' && github.event.comment.user.type != 'Bot' &&
            contains(github.event.comment.body, inputs.trigger_phrase) &&
            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-          (inputs.mode == 'auto' && github.event.action == 'created' &&
+          (inputs.mode == 'auto' && github.event.action == 'created' && github.event.comment.user.type == 'Bot' &&
            startsWith(github.event.comment.body, 'Ran Plan') &&
            contains(format(',{0},{0}[bot],', inputs.atlantis_bot), format(',{0},', github.event.comment.user.login))) ||
-          (inputs.mode == 'auto' && contains(github.event.comment.body, 'spacelift.io/stack/') &&
+          (inputs.mode == 'auto' && github.event.action != 'deleted' && github.event.comment.user.type == 'Bot' &&
+           contains(github.event.comment.body, 'spacelift.io/stack/') &&
            contains(format(',{0},{0}[bot],', inputs.spacelift_bot), format(',{0},', github.event.comment.user.login)))
         )
       ))
-    # Bot logins are accepted with or without the "[bot]" suffix. Edited comments count only for
+    # Bot logins are accepted with or without the "[bot]" suffix, and only from accounts of type
+    # Bot: the bare slug of a GitHub App can also be a user account. Edited comments count only for
     # Spacelift, which updates its comments in place. Atlantis only creates comments, and when it
     # minimizes its previous plan comments GitHub raises `edited` events for them; without the
     # `created` check each new plan would start a second run. Humans trigger by posting a new
@@ -139,6 +142,7 @@ jobs:
           COMMENT_LOGIN: ${{ github.event.comment.user.login }}
           COMMENT_TYPE: ${{ github.event.comment.user.type }}
           COMMENT_ACTION: ${{ github.event.action }}
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
           TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
           ATLANTIS_BOT: ${{ inputs.atlantis_bot }}
           SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
@@ -160,13 +164,21 @@ jobs:
           LOGIN="${COMMENT_LOGIN%\[bot\]}"
           case "$EVENT_NAME" in
             issue_comment)
-              if [[ "$COMMENT_TYPE" != "Bot" && "$COMMENT_BODY" == *"$TRIGGER_PHRASE"* ]]; then
+              # The job-level `if` already applied these rules; they are repeated here so the
+              # bash stays correct on its own. Phrase match is case-insensitive like contains().
+              if [[ "$COMMENT_TYPE" != "Bot" && "${COMMENT_BODY,,}" == *"${TRIGGER_PHRASE,,}"* ]]; then
+                case "$COMMENT_ASSOCIATION" in
+                  OWNER|MEMBER|COLLABORATOR) ;;
+                  *) skip "commenter is $COMMENT_ASSOCIATION, not a repository owner, member or collaborator." ;;
+                esac
+                [[ "$COMMENT_ACTION" == "created" ]] || skip "edited human comments are not a trigger."
                 TRIGGER=on-demand
-              elif [[ "$LOGIN" == "${ATLANTIS_BOT%\[bot\]}" ]]; then
+              elif [[ "$COMMENT_TYPE" == "Bot" && "$LOGIN" == "${ATLANTIS_BOT%\[bot\]}" ]]; then
                 # Minimizing older plan comments raises `edited` events with the same body.
                 [[ "$COMMENT_ACTION" == "created" ]] || skip "Atlantis comment was edited, not posted."
                 TRIGGER=atlantis-plan
-              elif [[ "$LOGIN" == "${SPACELIFT_BOT%\[bot\]}" ]]; then
+              elif [[ "$COMMENT_TYPE" == "Bot" && "$LOGIN" == "${SPACELIFT_BOT%\[bot\]}" ]]; then
+                [[ "$COMMENT_ACTION" != "deleted" ]] || skip "Spacelift comment was deleted."
                 # Deploy notifications (posted after merge) are not plans.
                 if [[ "$COMMENT_BODY" =~ ^(:heavy_check_mark:|:x:)\ \*\*Deploy ]]; then
                   skip "Spacelift comment is a deploy notification."
