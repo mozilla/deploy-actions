@@ -213,20 +213,19 @@ runs:
         fi
 
         # Statuses and check runs carry the Atlantis plan summary, lock state and CI results.
-        # Permissions may not allow this; it is optional context. `gh pr checks` exits 8 when any
-        # check is still pending, which is always the case here (this run is one of them).
-        set +e
-        gh pr checks "$PR_NUMBER" --repo "$REPOSITORY" --json name,state,description,link > checks.json 2> checks.err
-        RC=$?
-        set -e
-        if [[ ($RC -eq 0 || $RC -eq 8) ]] && jq -e 'type == "array"' checks.json > /dev/null 2>&1; then
-          CHECKS="available"
+        # REST, not `gh pr checks`: its GraphQL query reads workflow-run details that need
+        # actions: read, and it exits 8 while any check is pending (this run always is).
+        CHECKS="available"
+        if gh api --paginate "repos/$REPOSITORY/commits/$HEAD_SHA/status?per_page=100" \
+             --jq '.statuses[] | {name: .context, state: .state, description: (.description // ""), link: (.target_url // "")}' > statuses.jsonl 2> checks.err \
+           && gh api --paginate "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100" \
+             --jq '.check_runs[] | {name: .name, state: (.conclusion // .status), description: (.output.title // ""), link: (.html_url // "")}' > check-runs.jsonl 2>> checks.err; then
+          cat statuses.jsonl check-runs.jsonl | jq -s '.' > checks.json
         else
           CHECKS="unavailable"
-          echo "::notice::Could not read checks for #$PR_NUMBER (gh exit $RC: $(head -c 300 checks.err | tr '\n' ' ')). The token needs checks: read and statuses: read."
-          rm -f checks.json
+          echo "::notice::Could not read checks for #$PR_NUMBER ($(head -c 300 checks.err | tr '\n' ' ')). The token needs checks: read and statuses: read."
         fi
-        rm -f checks.err
+        rm -f statuses.jsonl check-runs.jsonl checks.err
 
         rm -f comments.json
         jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" --arg checks "$CHECKS" \
