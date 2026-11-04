@@ -144,6 +144,7 @@ runs:
         ATLANTIS_BOT: ${{ inputs.atlantis_bot }}
         SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
         HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
+        TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
       run: |
         set -euo pipefail
         cd "$CTX"
