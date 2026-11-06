@@ -30,6 +30,14 @@ Four jobs:
 | `post` | write | Minimizes earlier review comments, posts exactly one new one, optionally sets a commit status. A failed review still produces a comment so a silent run never reads as a clean one. |
 | `health` | caller's | Schedule only. Audits the `post` job's conclusions over the last 7 days (it fails whenever no review was produced) and fails (optionally posting to Slack) when reviews are failing or the workflow is not starting. |
 
+Each trigger reviews its own source, so a PR that has both a plan and a Helm diff gets two
+short reviews rather than the same findings twice: plan comments (`atlantis-plan`,
+`spacelift-plan`) review the Terraform plans and the code behind them and leave the Helm diff to
+the Helm caller; the `helm-diff` trigger reviews the Helm diff and chart changes only; `@claude`
+and `pull_request` review everything. A repository that wants its Helm diffs reviewed therefore
+chains the review after `diff-rendered-charts` (below). Each finding carries an action line, and
+apply readiness is capped at three facts.
+
 The `review` job has a per-PR concurrency group with `cancel-in-progress`, so the newest plan
 comment or request supersedes a running review. Only review triggers reach that job, so an
 unrelated comment (including your own `atlantis plan`) cannot cancel a review in flight.
@@ -215,17 +223,16 @@ jobs:
 ```markdown
 ### Claude review: Plan destroys 2 resources the diff does not touch.
 
-**Status:** findings  |  **Reviewed:** Atlantis plan: 2 projects, PR diff  |  **Missing:** Helm diff
+**Status:** findings  |  **Reviewed:** Atlantis plan: 2 projects, PR diff
 
 #### Findings
 - **:red_circle: high** · `terraform-plan` · **Forced replacement of the prod Cloud SQL instance**
-  The plan replaces `google_sql_database_instance.main` in `dataservices-high/tf/prod` because
-  `settings.tier` changed, but the PR only adds a read replica.
-  `google_sql_database_instance.main`, `# forces replacement`
+  `settings.tier` changed, so the instance is replaced; the PR only adds a read replica.
+  **Action:** Drop the tier change or move it to its own PR with a maintenance window.
+  `google_sql_database_instance.main`, `dataservices-high/tf/prod`
 
 #### Apply readiness
-- Plans present for both touched projects; no lock contention.
-- `dataservices-high/tf/nonprod` will not autodeploy on merge.
+- `dataservices-high/tf/nonprod` autodeploys on merge.
 
 <sub>trigger: atlantis-plan · model: default · $1.84 · 23 turns · 96s · run</sub>
 ```

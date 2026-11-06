@@ -162,6 +162,7 @@ runs:
         SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
         HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
         TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+        RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
         cd "$CTX"
@@ -210,34 +211,52 @@ runs:
         fi
         HUMAN_SEL='((.author.__typename // "") != "Bot") and ((.body | ascii_downcase | contains("'"${TRIGGER_PHRASE,,}"'")) | not)'
 
-        N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
-        N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
-        N_KUBE=$(render "$KUBE_SEL" validation.md "Manifest validation")
+        # Each trigger reviews its own source. A PR that has both a plan and a Helm diff gets two
+        # reviews (one per caller, each with its own marker); giving both the full context would
+        # post the same findings twice. on-demand and pull-request review everything.
+        case "$TRIGGER" in
+          atlantis-plan|spacelift-plan) SCOPE=terraform ;;
+          helm-diff) SCOPE=helm ;;
+          *) SCOPE=full ;;
+        esac
+
+        N_ATL=0; N_SPL=0; ATL_STALE=false
+        if [[ "$SCOPE" != "helm" ]]; then
+          N_ATL=$(render "$ATL_SEL" atlantis-plans.md "Atlantis comments (oldest first)")
+          N_SPL=$(render "$SPL_SEL" spacelift-runs.md "Spacelift run comments (oldest first)")
+          # Is the newest Atlantis message an unlock or lock notice? Then the plan is stale/missing.
+          ATL_STALE=$(jq -r "[.[] | select($ATL_SEL)] | last | (.body // \"\") | test(\"Locks and plans deleted|currently locked\")" comments.json)
+        fi
         N_HUMAN=$(render "$HUMAN_SEL" discussion.md "Human discussion (untrusted, oldest first)")
 
-        # Is the newest Atlantis message an unlock or lock notice? Then the plan is stale/missing.
-        ATL_STALE=$(jq -r "[.[] | select($ATL_SEL)] | last | (.body // \"\") | test(\"Locks and plans deleted|currently locked\")" comments.json)
-
-        HELM_SOURCE="none"
-        if [[ -n "$HELM_ARTIFACT" && -s helm-diff/diff.log ]]; then
-          HELM_SOURCE="artifact"
-        elif [[ -n "$HELM_ARTIFACT" ]]; then
-          echo "::warning::Helm diff artifact '$HELM_ARTIFACT' has no diff.log; falling back to PR comments."
-        fi
-        if [[ "$HELM_SOURCE" == "none" ]]; then
-          N_HELM=$(render "$HELM_SEL" helm-diff.md "Helm diff comments (oldest first; the last 'Changes found' comment and its continuations are current)")
-          [[ "$N_HELM" -gt 0 ]] && HELM_SOURCE="comments"
+        N_KUBE=0; HELM_SOURCE="none"
+        if [[ "$SCOPE" != "terraform" ]]; then
+          N_KUBE=$(render "$KUBE_SEL" validation.md "Manifest validation")
+          if [[ -n "$HELM_ARTIFACT" && -s helm-diff/diff.log ]]; then
+            HELM_SOURCE="artifact"
+          elif [[ -n "$HELM_ARTIFACT" ]]; then
+            echo "::warning::Helm diff artifact '$HELM_ARTIFACT' has no diff.log; falling back to PR comments."
+          fi
+          if [[ "$HELM_SOURCE" == "none" ]]; then
+            N_HELM=$(render "$HELM_SEL" helm-diff.md "Helm diff comments (oldest first; the last 'Changes found' comment and its continuations are current)")
+            [[ "$N_HELM" -gt 0 ]] && HELM_SOURCE="comments"
+          fi
+        else
+          rm -rf helm-diff
         fi
 
         # Statuses and check runs carry the Atlantis plan summary, lock state and CI results.
         # REST, not `gh pr checks`: its GraphQL query reads workflow-run details that need
         # actions: read, and it exits 8 while any check is pending (this run always is).
+        # This run's own jobs and any other Claude review job or status are dropped: a review
+        # reporting that it is itself in progress is noise.
         CHECKS="available"
         if gh api --paginate "repos/$REPOSITORY/commits/$HEAD_SHA/status?per_page=100" \
              --jq '.statuses[] | {name: .context, state: .state, description: (.description // ""), link: (.target_url // "")}' > statuses.jsonl 2> checks.err \
            && gh api --paginate "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100" \
              --jq '.check_runs[] | {name: .name, state: (.conclusion // .status), description: (.output.title // ""), link: (.html_url // "")}' > check-runs.jsonl 2>> checks.err; then
-          cat statuses.jsonl check-runs.jsonl | jq -s '.' > checks.json
+          cat statuses.jsonl check-runs.jsonl \
+            | jq -s --arg run "/actions/runs/$RUN_ID/" '[.[] | select((.link | contains($run)) or (.name | test("claude[-_ ]?review"; "i")) | not)]' > checks.json
         else
           CHECKS="unavailable"
           echo "::notice::Could not read checks for #$PR_NUMBER ($(head -c 300 checks.err | tr '\n' ' ')). The token needs checks: read and statuses: read."
@@ -245,10 +264,10 @@ runs:
         rm -f statuses.jsonl check-runs.jsonl checks.err
 
         rm -f comments.json
-        jq -n --arg trigger "$TRIGGER" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" --arg checks "$CHECKS" \
+        jq -n --arg trigger "$TRIGGER" --arg scope "$SCOPE" --arg head "$HEAD_SHA" --arg helm "$HELM_SOURCE" --arg checks "$CHECKS" \
           --argjson atl "$N_ATL" --argjson atl_stale "$ATL_STALE" --argjson spl "$N_SPL" \
           --argjson kube "$N_KUBE" --argjson human "$N_HUMAN" \
-          '{trigger: $trigger, head_sha: $head,
+          '{trigger: $trigger, scope: $scope, head_sha: $head,
             sources: {atlantis_comments: $atl, atlantis_plan_stale_or_locked: $atl_stale,
                       spacelift_comments: $spl, helm_diff: $helm, validation_comments: $kube,
                       checks: $checks, human_comments: $human}}' > manifest.json
@@ -449,7 +468,7 @@ runs:
           # Model text is posted by a bot with the write token: keep @mentions from notifying
           # anyone and turn images (remote fetch on render) into plain links.
           def safe: (. // "" | tostring)
-            | gsub("(?<![`A-Za-z0-9_])@(?<n>[A-Za-z0-9][A-Za-z0-9-]*(/[A-Za-z0-9._-]+)?)"; "`@\(.n)`")
+            | gsub("(?<![`A-Za-z0-9_])@(?<n>[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?)"; "`@\(.n)`")
             | gsub("!\\[(?<a>[^\\]]*)\\]\\((?<u>[^)]*)\\)"; "[\(.a)](\(.u))")
             | gsub("<(?<t>img|picture|source|video|audio|iframe)\\b"; "&lt;\(.t)"; "i");
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + safe) | join("\n")) end;
@@ -464,6 +483,7 @@ runs:
             (if $r == null then null elif ($r.findings | length) == 0 then "_No findings._" else
               "#### Findings\n" + ($r.findings | map(
                 "- **" + ((.severity // "low") | sev) + "** · `" + ((.source // "code") | safe) + "` · **" + (.title | safe) + "**\n  " + (.detail | safe | gsub("\n"; "\n  "))
+                + (if ((.action // "") != "") then "\n  **Action:** " + (.action | safe | gsub("\n"; " ")) else "" end)
                 + (if ((.references // []) | length) > 0 then "\n  " + (.references | map("`" + (safe | gsub("`"; "\u0027")) + "`") | join(", ")) else "" end)
               ) | join("\n")) end),
             (if $r == null or (($r.apply_readiness // []) | length) == 0 then null else

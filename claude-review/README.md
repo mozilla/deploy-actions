@@ -58,7 +58,10 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 
 The action fetches, with fixed queries, the PR metadata and changed files, non-minimized
 Atlantis and Spacelift comments, the Helm diff (artifact or comment), kubeconform failures,
-checks and human discussion into `$RUNNER_TEMP/claude-review/`. HTML comments are stripped from
+checks and human discussion into `$RUNNER_TEMP/claude-review/`. The set follows the trigger:
+plan triggers get no Helm diff, `helm-diff` gets no plan comments, `on-demand` and
+`pull-request` get everything, so two reviews on one PR do not repeat each other. Checks from
+this run and other Claude review jobs are dropped. HTML comments are stripped from
 fetched bodies. The prompt in [`prompt.md`](./prompt.md) treats all of it as untrusted data.
 Repo-level `.claude/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md` are removed from the checkout and
 memory files are not loaded before Claude runs. Claude returns structured output matching [`schema.json`](./schema.json); the comment is rendered from
