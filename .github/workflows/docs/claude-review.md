@@ -38,6 +38,13 @@ and `pull_request` review everything. A repository that wants its Helm diffs rev
 chains the review after `diff-rendered-charts` (below). Each finding carries an action line, and
 apply readiness is capped at three facts.
 
+To pause reviews on a PR that is still iterating, add the `no-claude-review` label (the
+`skip_label` input). Plan comments, Helm diffs and `pull_request` events then skip in the gate
+without starting a runner; `@claude` still gets a one-off review. Remove the label when the PR
+is ready. Every review comment ends with a footer that says so. The label must exist in the
+repository; create it once with `gh label create no-claude-review --color ededed
+--description "Pause automatic Claude reviews on this PR"`.
+
 The `review` job has a per-PR concurrency group with `cancel-in-progress`, so the newest plan
 comment or request supersedes a running review. Only review triggers reach that job, so an
 unrelated comment (including your own `atlantis plan`) cannot cancel a review in flight.
@@ -84,6 +91,7 @@ precedence when both are set.
 | `pr_number` | string | `""` | Explicit PR number for `workflow_dispatch` callers |
 | `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match. Bash pattern semantics: `*` also matches `/`, so `dir/*.yaml` covers subdirectories |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
+| `skip_label` | string | `no-claude-review` | PR label that pauses automatic reviews on that PR; the trigger phrase still works. Named in every comment's footer |
 | `anthropic_federation_rule_id` | string | `""` | Federation rule (`fdrl_...`) for this repository; with `anthropic_service_account_id`, authenticates with the job's OIDC token instead of `ANTHROPIC_API_KEY` |
 | `anthropic_service_account_id` | string | `""` | Service account (`svac_...`) the federated token acts as |
 | `anthropic_workspace_id` | string | `""` | Workspace (`wrkspc_...`) to scope the token to; optional when the rule targets one workspace |
@@ -235,6 +243,8 @@ jobs:
 #### Apply readiness
 - `dataservices-high/tf/nonprod` autodeploys on merge.
 
+<sub>Iterating? Add the `no-claude-review` label to this PR to pause automatic reviews; comment `@claude` for a one-off review.</sub>
+
 <sub>trigger: atlantis-plan · model: default · $1.84 · 23 turns · 96s · run</sub>
 ```
 
@@ -254,6 +264,8 @@ pin lives in this repository alone, with a Dependabot ignore rule. Callers refer
 
 - **Nothing happened after `@claude`.** Check the caller run: the `gate` job prints why it skipped
   (closed PR, fork, not a trigger). Closed PRs get a reply; forks do not.
+- **No review after a plan or push.** The PR may carry the `no-claude-review` label; the gate
+  says so in its log. `@claude` still works with the label on.
 - **Review cancelled.** A newer plan comment or request on the same PR superseded it. The newer run
   posts the review.
 - **"No review produced".** Usually the budget cap. Raise `budget_usd` or narrow `extra_prompt`.

@@ -83,6 +83,12 @@ on:
           needs its own marker so reviews do not collapse or cancel each other.
         type: string
         default: claude-review
+      skip_label:
+        description: >-
+          PR label that pauses automatic reviews (plan comments, Helm diff, pull_request) on that
+          PR. The trigger phrase still requests a review.
+        type: string
+        default: no-claude-review
       anthropic_federation_rule_id:
         description: >-
           Workload identity federation rule (fdrl_...) that accepts this repository's GitHub OIDC
@@ -132,9 +138,11 @@ jobs:
            contains(github.event.comment.body, inputs.trigger_phrase) &&
            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
           (inputs.mode == 'auto' && github.event.action == 'created' && github.event.comment.user.type == 'Bot' &&
+           !contains(github.event.issue.labels.*.name, inputs.skip_label) &&
            startsWith(github.event.comment.body, 'Ran Plan') &&
            contains(format(',{0},{0}[bot],', inputs.atlantis_bot), format(',{0},', github.event.comment.user.login))) ||
           (inputs.mode == 'auto' && github.event.action != 'deleted' && github.event.comment.user.type == 'Bot' &&
+           !contains(github.event.issue.labels.*.name, inputs.skip_label) &&
            contains(github.event.comment.body, 'spacelift.io/stack/') &&
            contains(format(',{0},{0}[bot],', inputs.spacelift_bot), format(',{0},', github.event.comment.user.login)))
         )
@@ -178,6 +186,7 @@ jobs:
           PATHS: ${{ inputs.paths }}
           PATHS_IGNORE: ${{ inputs.paths_ignore }}
           MARKER: ${{ inputs.comment_marker }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
         run: |
           set -euo pipefail
           skip() { echo "::notice::Not reviewing: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -248,6 +257,11 @@ jobs:
           fi
           if [[ "$DRAFT" == "true" && "$TRIGGER" == "pull-request" ]]; then
             skip "PR #$PR_NUMBER is a draft."
+          fi
+          # The label pauses automatic reviews while a PR iterates; an explicit request still wins.
+          if [[ -n "$SKIP_LABEL" && "$TRIGGER" != "on-demand" ]] \
+             && jq -e --arg l "$SKIP_LABEL" '[.labels[].name] | index($l) != null' <<< "$PR_JSON" > /dev/null; then
+            skip "PR #$PR_NUMBER has the '$SKIP_LABEL' label; comment '$TRIGGER_PHRASE' for a one-off review."
           fi
 
           # Path filters apply to every trigger, since issue_comment events carry no paths.
@@ -338,6 +352,7 @@ jobs:
           pr_number: ${{ needs.gate.outputs.pr_number }}
           trigger: ${{ needs.gate.outputs.trigger }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
+          skip_label: ${{ inputs.skip_label }}
           atlantis_bot: ${{ inputs.atlantis_bot }}
           spacelift_bot: ${{ inputs.spacelift_bot }}
           helm_diff_artifact: ${{ inputs.helm_diff_artifact }}

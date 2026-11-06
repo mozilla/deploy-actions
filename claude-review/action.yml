@@ -46,6 +46,10 @@ inputs:
     description: Phrase humans use to request a review; such comments are left out of the discussion context.
     required: false
     default: "@claude"
+  skip_label:
+    description: PR label that pauses automatic reviews; named in the comment footer so authors can find it. Empty omits the footer line.
+    required: false
+    default: no-claude-review
   atlantis_bot:
     description: GitHub login of the Atlantis app that posts plan comments.
     required: false
@@ -395,6 +399,8 @@ runs:
         MODEL: ${{ inputs.model }}
         TRIGGER: ${{ inputs.trigger }}
         MARKER: ${{ inputs.comment_marker }}
+        SKIP_LABEL: ${{ inputs.skip_label }}
+        TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
         API_KEY: ${{ inputs.anthropic_api_key }}
         TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
@@ -462,7 +468,7 @@ runs:
 
         BODY=$(jq -rn --arg note "$NOTE" --arg structured "$STRUCTURED" --arg trigger "$TRIGGER" \
           --arg cost "$COST" --arg turns "$TURNS" --arg secs "$SECS" --arg model "${MODEL:-default}" --arg run "$RUN_URL" \
-          --arg marker "$MARKER" '
+          --arg marker "$MARKER" --arg skip_label "$SKIP_LABEL" --arg phrase "$TRIGGER_PHRASE" '
           ($structured | if . == "" then null else fromjson end) as $r
           | def sev: {"high": ":red_circle: high", "medium": ":large_orange_diamond: medium", "low": ":small_blue_diamond: low"}[.] // .;
           # Model text is posted by a bot with the write token: keep @mentions from notifying
@@ -490,6 +496,8 @@ runs:
             (if $r == null or (($r.apply_readiness // []) | length) == 0 then null else
               "#### Apply readiness\n" + list($r.apply_readiness; "") end),
             (if $note == "" then null else $note end),
+            (if $skip_label == "" then null else
+              "<sub>Iterating? Add the `" + ($skip_label | safe) + "` label to this PR to pause automatic reviews; comment `" + $phrase + "` for a one-off review.</sub>" end),
             "<sub>trigger: " + $trigger + " · model: " + $model + " · $" + $cost + " · " + $turns + " turns · " + $secs + "s · [run](" + $run + ")</sub>"
           ] | map(select(. != null)) | join("\n\n")')
 
