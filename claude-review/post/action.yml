@@ -58,7 +58,7 @@ runs:
           # The review job died before producing output. Say so instead of staying silent.
           REVIEW=$(jq -cn --arg pr "$FALLBACK_PR" --arg run "$RUN_URL" --arg marker "$MARKER" '{
             pr_number: $pr, head_sha: "", state: "failure", description: "Review job failed",
-            body: ($marker + "\n### Claude review: not produced\n\n> [!WARNING]\n> The review job failed before returning a result. See the [run log](" + $run + ")."),
+            body: ($marker + "\n### :robot: Claude review\n#### Not produced\n\n> [!WARNING]\n> The review job failed before returning a result. See the [run log](" + $run + ")."),
             error: "Claude review job produced no output."}')
         fi
         if ! jq -e '.pr_number and .body' <<< "$REVIEW" > /dev/null; then

@@ -473,7 +473,8 @@ runs:
             | gsub("<(?<t>img|picture|source|video|audio|iframe)\\b"; "&lt;\(.t)"; "i");
           def list(xs; empty_text): if ($r == null or (xs | length) == 0) then empty_text else (xs | map("- " + safe) | join("\n")) end;
           # One entry per section; null sections are dropped and the rest are separated by blank lines.
-          [ "<!-- " + $marker + " -->\n### Claude review: " + (if $r == null then "no review produced" else ($r.verdict | safe) end),
+          ({"atlantis-plan": "atlantis plan", "spacelift-plan": "spacelift plan", "helm-diff": "helm diff", "on-demand": "on demand", "pull-request": "pull request"}[$trigger] // $trigger) as $label
+          | [ "<!-- " + $marker + " -->\n### :robot: Claude review: " + $label + "\n#### " + (if $r == null then "No review produced" else ($r.verdict | safe) end),
             (if $r == null then null else
               "**Status:** " + ($r.status | safe)
               + "  |  **Reviewed:** " + (if (($r.sources_reviewed // []) | length) > 0 then ($r.sources_reviewed | map(safe) | join(", ")) else "nothing" end)

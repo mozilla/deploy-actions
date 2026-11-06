@@ -221,7 +221,8 @@ jobs:
 ## Example output
 
 ```markdown
-### Claude review: Plan destroys 2 resources the diff does not touch.
+### :robot: Claude review: atlantis plan
+#### Plan destroys 2 resources the diff does not touch.
 
 **Status:** findings  |  **Reviewed:** Atlantis plan: 2 projects, PR diff
 

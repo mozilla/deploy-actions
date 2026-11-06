@@ -239,7 +239,8 @@ jobs:
               # A human asked; answer so the request does not vanish.
               gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
                 -f body="<!-- $MARKER -->
-          ### Claude review: not run
+          ### :robot: Claude review: on demand
+          #### Not run
 
           This pull request is **$STATE**; there is nothing current to review." > /dev/null
             fi
