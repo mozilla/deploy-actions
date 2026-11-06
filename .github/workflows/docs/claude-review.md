@@ -43,8 +43,21 @@ Triggers, by caller event:
 | `workflow_dispatch` | Pass `pr_number` |
 | `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every review produced nothing, or when failed `post` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
 
-If the `ANTHROPIC_API_KEY` secret is empty the gate skips with a notice, so a repository can adopt
-the caller before the secret exists without PR noise.
+If neither the `ANTHROPIC_API_KEY` secret nor the federation inputs are set the gate skips with a
+notice, so a repository can adopt the caller before its credentials exist without PR noise.
+
+## Authentication
+
+Prefer workload identity federation: the review job exchanges its own GitHub OIDC token for a
+short-lived Anthropic token, so no API key is stored or rotated anywhere. Each consumer repository
+has an entry in `github_workloads` in
+[global-platform-admin `anthropic/tf/console/wif.tf`](https://github.com/mozilla/global-platform-admin/tree/main/anthropic/tf/console),
+named `claude-review-prod-<repo>`, billed to the Cloud Engineering workspace and bound to this
+workflow's path (the `job_workflow_ref` claim), so only `claude-review.yml` jobs in that repository
+can mint a token. Pass the stack's `workloads` output for the entry as `anthropic_federation_rule_id`
+and `anthropic_service_account_id`; they are identifiers, not secrets, and can sit in the workflow
+file or in repository variables. The `ANTHROPIC_API_KEY` secret remains supported and takes
+precedence when both are set.
 
 ## Inputs
 
@@ -63,17 +76,24 @@ the caller before the secret exists without PR noise.
 | `pr_number` | string | `""` | Explicit PR number for `workflow_dispatch` callers |
 | `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match. Bash pattern semantics: `*` also matches `/`, so `dir/*.yaml` covers subdirectories |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
+| `anthropic_federation_rule_id` | string | `""` | Federation rule (`fdrl_...`) for this repository; with `anthropic_service_account_id`, authenticates with the job's OIDC token instead of `ANTHROPIC_API_KEY` |
+| `anthropic_service_account_id` | string | `""` | Service account (`svac_...`) the federated token acts as |
+| `anthropic_workspace_id` | string | `""` | Workspace (`wrkspc_...`) to scope the token to; optional when the rule targets one workspace |
+| `anthropic_organization_id` | string | Mozilla's | Claude Console organization UUID; only override for another organization |
 
-Secrets: `ANTHROPIC_API_KEY` (required), `SLACK_WEBHOOK_URL` (optional, health check only).
+Secrets: `ANTHROPIC_API_KEY` (optional when the federation inputs are set), `SLACK_WEBHOOK_URL`
+(optional, health check only).
 
 ## Permissions
 
 The reusable workflow downgrades the `review` job to `contents: read`, `pull-requests: read`,
-`checks: read`, `statuses: read` (the last two let it read Atlantis plan statuses and CI results);
-the `gate` job declares `contents: read`, `pull-requests: write` (for its closed-PR reply); the
-`post` and `health` jobs inherit the caller's grant. GitHub validates every called job's
-declared permissions against the caller's grant at startup, including jobs that `if:` skips, which
-is why only the minimum is declared inside. Callers must grant at least:
+`checks: read`, `statuses: read` (the last two let it read Atlantis plan statuses and CI results)
+plus `id-token: write` (the GitHub OIDC token for workload identity federation); the `gate` job
+declares `contents: read`, `pull-requests: write` (for its closed-PR reply); the `post` and
+`health` jobs inherit the caller's grant. GitHub validates every called job's declared permissions
+against the caller's grant at startup, including jobs that `if:` skips, which is why only the
+minimum is declared inside and why `id-token: write` is required even from callers that still pass
+an API key. Callers must grant at least:
 
 ```yaml
 permissions:
@@ -81,6 +101,7 @@ permissions:
   pull-requests: write
   checks: read
   statuses: read    # statuses: write with post_status: true
+  id-token: write
   actions: read     # with a schedule trigger (health check)
 ```
 
@@ -117,11 +138,16 @@ jobs:
       pull-requests: write
       checks: read
       statuses: read
+      id-token: write
       actions: read
     with:
       atlantis_bot: ${{ vars.ATLANTIS_GITHUB_USER }}
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # From the `workloads` output of global-platform-admin anthropic/tf/console for this repo.
+      anthropic_federation_rule_id: fdrl_xxxxxxxxxxxxxxxxxxxxxxxx
+      anthropic_service_account_id: svac_xxxxxxxxxxxxxxxxxxxxxxxx
+    # Or, with a repository secret instead of federation:
+    # secrets:
+    #   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 ### After the Helm diff
@@ -145,10 +171,11 @@ jobs:
       pull-requests: write
       checks: read
       statuses: read
+      id-token: write
     with:
       helm_diff_artifact: ${{ needs.diff.outputs.diff_artifact }}
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      anthropic_federation_rule_id: fdrl_xxxxxxxxxxxxxxxxxxxxxxxx
+      anthropic_service_account_id: svac_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ### Using the composite actions directly
@@ -160,7 +187,7 @@ check out the PR head before the review step:
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions: { contents: read, pull-requests: read, checks: read, statuses: read }
+    permissions: { contents: read, pull-requests: read, checks: read, statuses: read, id-token: write }
     outputs: { review: ${{ steps.review.outputs.review }} }
     steps:
       - uses: actions/checkout@<sha>
@@ -168,7 +195,8 @@ jobs:
       - id: review
         uses: mozilla/deploy-actions/claude-review@<sha>
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_federation_rule_id: fdrl_xxxxxxxxxxxxxxxxxxxxxxxx # or anthropic_api_key
+          anthropic_service_account_id: svac_xxxxxxxxxxxxxxxxxxxxxxxx
           pr_number: ${{ github.event.issue.number }}
   post:
     needs: review
@@ -226,6 +254,11 @@ pin lives in this repository alone, with a Dependabot ignore rule. Callers refer
   composite, this shows as a failed `post` job rather than `startup_failure`. Fix it here once;
   every caller recovers. The scheduled health check reports it as reviews that "produced nothing
   and none succeeded".
+- **"Failed to fetch a GitHub Actions OIDC token"** or a 401 from the token exchange. The caller
+  is missing `id-token: write`, or the federation rule does not match: the rule is bound to this
+  repository and to `claude-review.yml` in `mozilla/deploy-actions`, so a copy of the workflow
+  under another path, or a run in a repository without a `github_workloads` entry, is refused.
+  Check the entry in global-platform-admin `anthropic/tf/console/wif.tf`.
 - **Spacelift plans not reviewed.** The Spacelift notification policy must post run comments on
   the PR (see `spacelift/tf/root/policies/notification/` in global-platform-admin); the review
   reads comments, it does not call the Spacelift API.

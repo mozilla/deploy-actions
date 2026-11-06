@@ -83,10 +83,36 @@ on:
           needs its own marker so reviews do not collapse or cancel each other.
         type: string
         default: claude-review
+      anthropic_federation_rule_id:
+        description: >-
+          Workload identity federation rule (fdrl_...) that accepts this repository's GitHub OIDC
+          token. With anthropic_service_account_id, the review authenticates to the Claude API with
+          the job's OIDC token instead of the ANTHROPIC_API_KEY secret; callers must grant
+          id-token: write. These IDs are identifiers, not secrets (global-platform-admin
+          anthropic/tf/console, `workloads` output).
+        type: string
+        default: ""
+      anthropic_service_account_id:
+        description: Anthropic service account (svac_...) the federated token acts as.
+        type: string
+        default: ""
+      anthropic_workspace_id:
+        description: >-
+          Anthropic workspace (wrkspc_...) to scope the federated token to. Optional when the rule
+          targets a single workspace.
+        type: string
+        default: ""
+      anthropic_organization_id:
+        description: Anthropic organization UUID for federation. Defaults to Mozilla's Claude Console organization.
+        type: string
+        default: bc6e8deb-65ec-4bee-8ca0-b8ff93b3295f
     secrets:
       ANTHROPIC_API_KEY:
-        description: Anthropic API key.
-        required: true
+        description: >-
+          Anthropic API key. Leave it unset to use workload identity federation through the
+          anthropic_federation_rule_id and anthropic_service_account_id inputs. When both are set
+          the key wins and federation is not used.
+        required: false
       SLACK_WEBHOOK_URL:
         description: Optional incoming webhook; the scheduled health check posts there when reviews are failing.
         required: false
@@ -148,6 +174,7 @@ jobs:
           SPACELIFT_BOT: ${{ inputs.spacelift_bot }}
           HELM_ARTIFACT: ${{ inputs.helm_diff_artifact }}
           HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_FEDERATION: ${{ inputs.anthropic_federation_rule_id != '' && inputs.anthropic_service_account_id != '' }}
           PATHS: ${{ inputs.paths }}
           PATHS_IGNORE: ${{ inputs.paths_ignore }}
           MARKER: ${{ inputs.comment_marker }}
@@ -157,8 +184,9 @@ jobs:
 
           PR_NUMBER="${INPUT_PR:-$EVENT_PR}"
           [[ -n "$PR_NUMBER" ]] || skip "no pull request number in this event."
-          # A repo can adopt the caller workflow before the secret exists without spamming PRs.
-          [[ "$HAS_API_KEY" == "true" ]] || skip "ANTHROPIC_API_KEY secret is not set in this repository."
+          # A repo can adopt the caller workflow before its credentials exist without spamming PRs.
+          [[ "$HAS_API_KEY" == "true" || "$HAS_FEDERATION" == "true" ]] \
+            || skip "neither the ANTHROPIC_API_KEY secret nor the anthropic_federation_rule_id and anthropic_service_account_id inputs are set."
 
           TRIGGER=""
           LOGIN="${COMMENT_LOGIN%\[bot\]}"
@@ -276,12 +304,15 @@ jobs:
       group: ${{ inputs.comment_marker }}-${{ github.repository }}-${{ needs.gate.outputs.pr_number }}
       cancel-in-progress: true
     # Read-only: a token Claude could read is worth little. checks/statuses let the collect step
-    # read Atlantis `atlantis/plan:<project>` statuses and CI results; callers must grant both.
+    # read Atlantis `atlantis/plan:<project>` statuses and CI results; id-token lets the action
+    # fetch the GitHub OIDC token it exchanges for an Anthropic token (workload identity
+    # federation). Callers must grant all of them, whichever credential they use.
     permissions:
       contents: read
       pull-requests: read
       checks: read
       statuses: read
+      id-token: write
     outputs:
       review: ${{ steps.review.outputs.review }}
     steps:
@@ -299,6 +330,10 @@ jobs:
         uses: $/claude-review
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          anthropic_federation_rule_id: ${{ inputs.anthropic_federation_rule_id }}
+          anthropic_service_account_id: ${{ inputs.anthropic_service_account_id }}
+          anthropic_workspace_id: ${{ inputs.anthropic_workspace_id }}
+          anthropic_organization_id: ${{ inputs.anthropic_organization_id }}
           pr_number: ${{ needs.gate.outputs.pr_number }}
           trigger: ${{ needs.gate.outputs.trigger }}
           trigger_phrase: ${{ inputs.trigger_phrase }}

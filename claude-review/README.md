@@ -14,7 +14,11 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 <!--inputs-->
 | Name                 | Description                                                                                                                                                                                          | Required | Default               |
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|-----------------------|
-| `anthropic_api_key`  | Anthropic API key.                                                                                                                                                                                   | `true`   | ` `                   |
+| `anthropic_api_key`  | Anthropic API key. Leave empty to authenticate with workload identity federation through the anthropic_federation_rule_id and anthropic_service_account_id inputs (the job needs id-token:write). A key set alongside them takes precedence. | `false`  | ` `                   |
+| `anthropic_federation_rule_id` | Workload identity federation rule (fdrl_...) that accepts this repository's GitHub OIDC token. An identifier, not a secret.                                                                | `false`  | ` `                   |
+| `anthropic_service_account_id` | Anthropic service account (svac_...) the federated token acts as.                                                                                                                          | `false`  | ` `                   |
+| `anthropic_workspace_id` | Anthropic workspace (wrkspc_...) to scope the federated token to. Optional when the rule targets a single workspace.                                                                             | `false`  | ` `                   |
+| `anthropic_organization_id` | Anthropic organization UUID for federation. Defaults to Mozilla's Claude Console organization.                                                                                                | `false`  | `bc6e8deb-65ec-4bee-8ca0-b8ff93b3295f` |
 | `pr_number`          | Pull request number to review.                                                                                                                                                                       | `true`   | ` `                   |
 | `github_token`       | GitHub token with contents:read, pull-requests:read, checks:read and statuses:read (the last two are optional; without them CI statuses are not collected). Nothing in this action writes to GitHub. | `false`  | `${{ github.token }}` |
 | `trigger`            | What started this review: on-demand, atlantis-plan, spacelift-plan, helm-diff or pull-request. Plan triggers wait `debounce_seconds` so continuation comments can land.                              | `false`  | `on-demand`           |
@@ -42,7 +46,11 @@ Use this action directly when you need your own trigger, gate or concurrency rul
 
 - Check out the pull request head into the workspace before this step.
 - Run it in a job whose token is read-only (`contents: read`, `pull-requests: read`, plus
-  `checks: read` and `statuses: read` for CI context).
+  `checks: read` and `statuses: read` for CI context, and `id-token: write` for workload identity
+  federation).
+- Authenticate with workload identity federation where possible: pass the repository's
+  `anthropic_federation_rule_id` and `anthropic_service_account_id` from the `workloads` output of
+  global-platform-admin `anthropic/tf/console` and leave `anthropic_api_key` empty.
 - Pass the `review` output to [`claude-review/post`](./post/README.md) in a separate job with
   `pull-requests: write`.
 
@@ -67,7 +75,8 @@ injected review cannot notify people or trigger remote fetches.
 - id: review
   uses: mozilla/deploy-actions/claude-review@<sha>
   with:
-    anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+    anthropic_federation_rule_id: fdrl_xxxxxxxxxxxxxxxxxxxxxxxx # or anthropic_api_key
+    anthropic_service_account_id: svac_xxxxxxxxxxxxxxxxxxxxxxxx
     pr_number: ${{ github.event.issue.number }}
     trigger: on-demand
     atlantis_bot: ${{ vars.ATLANTIS_GITHUB_USER }}

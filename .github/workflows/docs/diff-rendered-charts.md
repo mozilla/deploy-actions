@@ -34,10 +34,11 @@ Chain a [`claude-review`](./claude-review.md) job on these outputs to have the d
       pull-requests: write
       checks: read
       statuses: read
+      id-token: write
     with:
       helm_diff_artifact: ${{ needs.diff-charts.outputs.diff_artifact }}
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      anthropic_federation_rule_id: fdrl_xxxxxxxxxxxxxxxxxxxxxxxx # see docs/claude-review.md
+      anthropic_service_account_id: svac_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 The diff comment carries the hidden marker `<!-- helm-diff -->`; earlier diff comments (including

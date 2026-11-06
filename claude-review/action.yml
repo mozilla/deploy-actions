@@ -10,8 +10,25 @@ description: >-
 
 inputs:
   anthropic_api_key:
-    description: Anthropic API key.
-    required: true
+    description: Anthropic API key. Leave empty to authenticate with workload identity federation through the anthropic_federation_rule_id and anthropic_service_account_id inputs (the job needs id-token:write). A key set alongside them takes precedence.
+    required: false
+    default: ""
+  anthropic_federation_rule_id:
+    description: Workload identity federation rule (fdrl_...) that accepts this repository's GitHub OIDC token. An identifier, not a secret.
+    required: false
+    default: ""
+  anthropic_service_account_id:
+    description: Anthropic service account (svac_...) the federated token acts as.
+    required: false
+    default: ""
+  anthropic_workspace_id:
+    description: Anthropic workspace (wrkspc_...) to scope the federated token to. Optional when the rule targets a single workspace.
+    required: false
+    default: ""
+  anthropic_organization_id:
+    description: Anthropic organization UUID for federation. Defaults to Mozilla's Claude Console organization.
+    required: false
+    default: bc6e8deb-65ec-4bee-8ca0-b8ff93b3295f
   pr_number:
     description: Pull request number to review.
     required: true
@@ -314,6 +331,13 @@ runs:
         CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1" # No CLAUDE.md/AGENTS.md from the PR branch as instructions.
       with:
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        # Workload identity federation: with a rule and service account (and no API key) the action
+        # fetches the job's GitHub OIDC token and the CLI exchanges it for a short-lived Anthropic
+        # token; the identity token lives in $RUNNER_TEMP/claude-workload-identity for the step.
+        anthropic_federation_rule_id: ${{ inputs.anthropic_federation_rule_id }}
+        anthropic_service_account_id: ${{ inputs.anthropic_service_account_id }}
+        anthropic_workspace_id: ${{ inputs.anthropic_workspace_id }}
+        anthropic_organization_id: ${{ inputs.anthropic_federation_rule_id && inputs.anthropic_organization_id || '' }}
         # An explicit token stops the action from minting a Claude App OIDC token (needs id-token: write).
         github_token: ${{ inputs.github_token }}
         # Plan comments are authored by apps; the action rejects bot actors unless listed.
@@ -337,7 +361,7 @@ runs:
           --disallowedTools "Bash(gh pr review:*)" "Bash(gh pr comment:*)" "Bash(gh pr merge:*)" "Bash(gh pr edit:*)" "Bash(gh pr close:*)" "Bash(gh pr ready:*)"
           --disallowedTools "Bash(gh api:*)" "Bash(gh issue:*)" "Bash(gh release:*)" "Bash(gh workflow:*)" "Bash(gh run:*)" "Bash(gh secret:*)" "Bash(gh variable:*)"
           --disallowedTools "Bash(curl:*)" "Bash(wget:*)" "Bash(git push:*)" "Bash(git remote:*)" "Bash(git config:*)" "Bash(git credential:*)"
-          --disallowedTools "Read(/.git/**)" "Read(//proc/**)" "Read(/${{ runner.temp }}/_runner_file_commands/**)"
+          --disallowedTools "Read(/.git/**)" "Read(//proc/**)" "Read(/${{ runner.temp }}/_runner_file_commands/**)" "Read(/${{ runner.temp }}/claude-workload-identity/**)"
 
     # Runs after a failure too, so a budget cap or crash still produces a legible result.
     - name: Prepare review
