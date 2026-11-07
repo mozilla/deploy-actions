@@ -112,7 +112,7 @@ jobs:
           fi
       - name: Build and Tag Container Image
         id: build
-        uses: mozilla/deploy-actions/docker-build@v6.2.0
+        uses: $/docker-build
         with:
           image_name: ${{ inputs.image_name }}
           gar_name: ${{ inputs.gar_name }}
@@ -144,7 +144,7 @@ jobs:
           fi
       - name: Push Container Image
         if: ${{ inputs.push }}
-        uses: mozilla/deploy-actions/docker-push@v6.2.0
+        uses: $/docker-push
         with:
           image_tags: ${{ steps.build.outputs.image_tags }}
           should_authenticate_to_ghcr: ${{ inputs.should_tag_ghcr }}

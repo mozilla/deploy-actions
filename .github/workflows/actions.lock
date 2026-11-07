@@ -5,7 +5,13 @@ version: 'v0.0.3'
 workflows:
     '.github/workflows/build-and-push.yml':
         - 'actions/checkout@v6.0.2'
-        - 'mozilla/deploy-actions@v6.2.0'
+        - 'docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83'
+        - 'docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772'
+        - 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
+        - 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051'
+        - 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
+        - 'docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4'
+        - 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093'
     '.github/workflows/claude-review.yml':
         - 'actions/checkout@v6.0.2'
         - 'actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3'
@@ -102,9 +108,14 @@ dependencies:
         commit: 'sha1-74a5d142397b4f367a81961eba4e8cd7edddf772'
         owner_id: 5429470
         repo_id: 287743349
-    'docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804':
-        ref: 'v5.7.0'
-        commit: 'sha1-902fa8ec7d6ecbf8d84d538b9b233a880e428804'
+    'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9':
+        ref: 'v3.7.0'
+        commit: 'sha1-c94ce9fb468520275223c153574b00df6fe4bcc9'
+        owner_id: 5429470
+        repo_id: 287743349
+    'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051':
+        ref: 'v5.10.0'
+        commit: 'sha1-c299e40c65443455700f0fdfc63efafe5b349051'
         owner_id: 5429470
         repo_id: 306769011
     'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f':
@@ -122,23 +133,11 @@ dependencies:
         commit: 'sha1-9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
         owner_id: 9919
         repo_id: 259445878
-    'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69':
-        ref: 'v1.3.0'
-        commit: 'sha1-3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+    'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093':
+        ref: 'v3.0.0'
+        commit: 'sha1-7c6bc770dae815cd3e89ee6cdf493a5fab2cc093'
         owner_id: 71461757
         repo_id: 407242578
-    'mozilla/deploy-actions@v6.2.0':
-        ref: 'v6.2.0'
-        commit: 'sha1-8d2c17a843ea376c58b4e88e55d1335bafd52bcb'
-        owner_id: 131524
-        repo_id: 501381393
-        uses:
-            - 'docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83'
-            - 'docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772'
-            - 'docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804'
-            - 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
-            - 'docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4'
-            - 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
     'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6':
         ref: 'v2.2.0'
         commit: 'sha1-0c5077e51419868618aeaa5fe8019c62421857d6'
