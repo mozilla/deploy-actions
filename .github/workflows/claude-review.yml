@@ -89,6 +89,13 @@ on:
           PR. The trigger phrase still requests a review.
         type: string
         default: no-claude-review
+      skip_bot_prs:
+        description: >-
+          Skip automatic reviews (plan comments, Helm diff, pull_request) on pull requests opened
+          by a bot such as Dependabot, whose plans are routinely automerged. The trigger phrase
+          still requests a review.
+        type: boolean
+        default: true
       anthropic_federation_rule_id:
         description: >-
           Workload identity federation rule (fdrl_...) that accepts this repository's GitHub OIDC
@@ -139,10 +146,12 @@ jobs:
            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
           (inputs.mode == 'auto' && github.event.action == 'created' && github.event.comment.user.type == 'Bot' &&
            !contains(github.event.issue.labels.*.name, inputs.skip_label) &&
+           (!inputs.skip_bot_prs || github.event.issue.user.type != 'Bot') &&
            startsWith(github.event.comment.body, 'Ran Plan') &&
            contains(format(',{0},{0}[bot],', inputs.atlantis_bot), format(',{0},', github.event.comment.user.login))) ||
           (inputs.mode == 'auto' && github.event.action != 'deleted' && github.event.comment.user.type == 'Bot' &&
            !contains(github.event.issue.labels.*.name, inputs.skip_label) &&
+           (!inputs.skip_bot_prs || github.event.issue.user.type != 'Bot') &&
            contains(github.event.comment.body, 'spacelift.io/stack/') &&
            contains(format(',{0},{0}[bot],', inputs.spacelift_bot), format(',{0},', github.event.comment.user.login)))
         )
@@ -171,7 +180,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_PR: ${{ inputs.pr_number }}
           EVENT_PR: ${{ github.event.pull_request.number || github.event.issue.number }}
-          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_LOGIN: ${{ github.event.comment.user.login }}
           COMMENT_TYPE: ${{ github.event.comment.user.type }}
@@ -187,6 +195,7 @@ jobs:
           PATHS_IGNORE: ${{ inputs.paths_ignore }}
           MARKER: ${{ inputs.comment_marker }}
           SKIP_LABEL: ${{ inputs.skip_label }}
+          SKIP_BOT_PRS: ${{ inputs.skip_bot_prs }}
         run: |
           set -euo pipefail
           skip() { echo "::notice::Not reviewing: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -226,7 +235,6 @@ jobs:
               fi
               ;;
             pull_request|pull_request_target)
-              [[ "$PR_AUTHOR_TYPE" != "Bot" ]] || skip "pull request opened by a bot; plan comments will still trigger a review."
               if [[ -n "$HELM_ARTIFACT" ]]; then TRIGGER=helm-diff; else TRIGGER=pull-request; fi
               ;;
             *)
@@ -262,6 +270,11 @@ jobs:
           if [[ -n "$SKIP_LABEL" && "$TRIGGER" != "on-demand" ]] \
              && jq -e --arg l "$SKIP_LABEL" '[.labels[].name] | index($l) != null' <<< "$PR_JSON" > /dev/null; then
             skip "PR #$PR_NUMBER has the '$SKIP_LABEL' label; comment '$TRIGGER_PHRASE' for a one-off review."
+          fi
+          # Bot-authored PRs (Dependabot bumps) are planned and automerged routinely; reviewing
+          # each one costs a run per bump for little signal. A human can still ask.
+          if [[ "$SKIP_BOT_PRS" == "true" && "$TRIGGER" != "on-demand" && "$(jq -r '.user.type // ""' <<< "$PR_JSON")" == "Bot" ]]; then
+            skip "PR #$PR_NUMBER was opened by a bot (skip_bot_prs); comment '$TRIGGER_PHRASE' for a one-off review."
           fi
 
           # Path filters apply to every trigger, since issue_comment events carry no paths.

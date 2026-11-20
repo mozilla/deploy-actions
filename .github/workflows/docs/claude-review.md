@@ -45,6 +45,10 @@ is ready. Every review comment ends with a footer that says so. The label must e
 repository; create it once with `gh label create no-claude-review --color ededed
 --description "Pause automatic Claude reviews on this PR"`.
 
+Pull requests opened by a bot, Dependabot above all, are not reviewed automatically either:
+their plans are produced and automerged routinely, and a review per bump costs a run for little
+signal. Set `skip_bot_prs: false` to review them; `@claude` works on them regardless.
+
 The `review` job has a per-PR concurrency group with `cancel-in-progress`, so the newest plan
 comment or request supersedes a running review. Only review triggers reach that job, so an
 unrelated comment (including your own `atlantis plan`) cannot cancel a review in flight.
@@ -54,7 +58,7 @@ Triggers, by caller event:
 | Caller event | When the review runs |
 |---|---|
 | `issue_comment` | A human with write access (owner, member or collaborator) posts a comment containing the trigger phrase (default `@claude`), or (in `auto` mode) Atlantis posts `Ran Plan ...`, or Spacelift posts or edits a run comment. Subscribe to `created` and `edited`; edits by humans are ignored, and so are the `edited` events Atlantis raises when it minimizes its previous plan comments |
-| `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Bot-authored and draft PRs are skipped here but still get plan-triggered reviews |
+| `pull_request` | On the event (use `opened`, `ready_for_review`); diff-only review when no plan exists yet. Draft PRs are skipped here but still get plan-triggered reviews |
 | `workflow_dispatch` | Pass `pr_number` |
 | `schedule` | No review. Runs the `health` job instead: audits the last 7 days of this workflow's runs in the calling repo and fails when any ended in `startup_failure`, when every review produced nothing, or when failed `post` jobs outnumber successful ones (gate-only runs are not counted). With the optional `SLACK_WEBHOOK_URL` secret it also posts to Slack. The caller must grant `actions: read` |
 
@@ -92,6 +96,7 @@ precedence when both are set.
 | `paths` / `paths_ignore` | string | `""` | Newline-separated globs applied to the PR's changed files on every trigger (plan comments carry no paths). `paths` requires a match; `paths_ignore` skips PRs whose files all match. Bash pattern semantics: `*` also matches `/`, so `dir/*.yaml` covers subdirectories |
 | `comment_marker` | string | `claude-review` | Identifier for this caller's comments and concurrency group. Give each caller on a repo its own |
 | `skip_label` | string | `no-claude-review` | PR label that pauses automatic reviews on that PR; the trigger phrase still works. Named in every comment's footer |
+| `skip_bot_prs` | boolean | `true` | Skip automatic reviews on PRs opened by a bot (Dependabot); the trigger phrase still works. Set `false` to review them |
 | `anthropic_federation_rule_id` | string | `""` | Federation rule (`fdrl_...`) for this repository; with `anthropic_service_account_id`, authenticates with the job's OIDC token instead of `ANTHROPIC_API_KEY` |
 | `anthropic_service_account_id` | string | `""` | Service account (`svac_...`) the federated token acts as |
 | `anthropic_workspace_id` | string | `""` | Workspace (`wrkspc_...`) to scope the token to; optional when the rule targets one workspace |
