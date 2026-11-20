@@ -52,7 +52,7 @@ jobs:
     steps:
         # Download charts already rendered by validate action
       - name: download artifacts
-        uses: actions/download-artifact@v8.0.0
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: k8s-manifests-*
           merge-multiple: true
